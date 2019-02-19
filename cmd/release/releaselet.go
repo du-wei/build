@@ -11,7 +11,9 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -21,19 +23,44 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
 func main() {
-	if err := blog(); err != nil {
+	if v, _ := strconv.ParseBool(os.Getenv("RUN_RELEASELET_TESTS")); v {
+		runSelfTests()
+		return
+	}
+
+	if err := godoc(); err != nil {
 		log.Fatal(err)
 	}
 	if err := tour(); err != nil {
 		log.Fatal(err)
 	}
+	if dir := archDir(); dir != "" {
+		if err := cp("go/bin/go", "go/bin/"+dir+"/go"); err != nil {
+			log.Fatal(err)
+		}
+		if err := cp("go/bin/gofmt", "go/bin/"+dir+"/gofmt"); err != nil {
+			log.Fatal(err)
+		}
+		os.RemoveAll("go/bin/" + dir)
+		os.RemoveAll("go/pkg/linux_amd64")
+		os.RemoveAll("go/pkg/tool/linux_amd64")
+	}
+	os.RemoveAll("go/pkg/obj")
 	var err error
 	switch runtime.GOOS {
 	case "windows":
+		// Clean up .exe~ files; golang.org/issue/23894
+		filepath.Walk("go", func(path string, fi os.FileInfo, err error) error {
+			if strings.HasSuffix(path, ".exe~") {
+				os.Remove(path)
+			}
+			return nil
+		})
 		err = windowsMSI()
 	case "darwin":
 		err = darwinPKG()
@@ -43,18 +70,27 @@ func main() {
 	}
 }
 
-const blogPath = "golang.org/x/blog"
-
-var blogContent = []string{
-	"content",
-	"template",
+func archDir() string {
+	if os.Getenv("GO_BUILDER_NAME") == "linux-s390x-crosscompile" {
+		return "linux_s390x"
+	}
+	return ""
 }
 
-func blog() error {
-	// Copy blog content to $GOROOT/blog.
-	blogSrc := filepath.Join("gopath/src", blogPath)
-	contentDir := filepath.FromSlash("go/blog")
-	return cpAllDir(contentDir, blogSrc, blogContent...)
+func godoc() error {
+	// Pre Go 1.7, the godoc binary is placed here by cmd/go.
+	// After Go 1.7, we need to copy the binary from GOPATH/bin to GOROOT/bin.
+	// TODO(cbro): Remove after Go 1.6 is no longer supported.
+	dst := filepath.FromSlash("go/bin/godoc" + ext())
+	if _, err := os.Stat(dst); err == nil {
+		return nil
+	}
+
+	// Copy godoc binary to $GOROOT/bin.
+	return cp(
+		dst,
+		filepath.FromSlash("gopath/bin/"+archDir()+"/godoc"+ext()),
+	)
 }
 
 const tourPath = "golang.org/x/tour"
@@ -68,11 +104,19 @@ var tourContent = []string{
 
 var tourPackages = []string{
 	"pic",
+	"reader",
 	"tree",
 	"wc",
 }
 
+// TODO: Remove after Go 1.13 is released, and Go 1.11 is no longer supported.
 func tour() error {
+	_, version, _ := environ()
+	verMajor, verMinor, _ := splitVersion(version)
+	if verMajor > 1 || verMinor >= 12 {
+		return nil // Only include the tour in go1.11.x and earlier releases.
+	}
+
 	tourSrc := filepath.Join("gopath/src", tourPath)
 	contentDir := filepath.FromSlash("go/misc/tour")
 
@@ -87,10 +131,10 @@ func tour() error {
 		return err
 	}
 
-	// Copy gotour binary to tool directory as "tour"; invoked as "go tool tour".
+	// Copy the tour binary to the tool directory, invoked as "go tool tour".
 	return cp(
 		filepath.FromSlash("go/pkg/tool/"+runtime.GOOS+"_"+runtime.GOARCH+"/tour"+ext()),
-		filepath.FromSlash("gopath/bin/gotour"+ext()),
+		filepath.FromSlash("gopath/bin/"+archDir()+"/tour"+ext()),
 	)
 }
 
@@ -213,11 +257,26 @@ func windowsMSI() error {
 		return err
 	}
 
+	msArch := func() string {
+		switch runtime.GOARCH {
+		default:
+			panic("unknown arch for windows " + runtime.GOARCH)
+		case "386":
+			return "x86"
+		case "amd64":
+			return "x64"
+		}
+	}
+
 	// Build package.
+	verMajor, verMinor, verPatch := splitVersion(version)
+
 	if err := runDir(win, filepath.Join(wix, "candle"),
 		"-nologo",
+		"-arch", msArch(),
 		"-dGoVersion="+version,
-		"-dWixGoVersion="+wixVersion(version),
+		fmt.Sprintf("-dWixGoVersion=%v.%v.%v", verMajor, verMinor, verPatch),
+		fmt.Sprintf("-dIsWinXPSupported=%v", wixIsWinXPSupported(version)),
 		"-dArch="+runtime.GOARCH,
 		"-dSourceDir="+goDir,
 		filepath.Join(win, "installer.wxs"),
@@ -241,7 +300,8 @@ func windowsMSI() error {
 	)
 }
 
-const wixBinaries = "https://storage.googleapis.com/go-builder-data/wix35-binaries.zip"
+const wixBinaries = "https://storage.googleapis.com/go-builder-data/wix311-binaries.zip"
+const wixSha256 = "da034c489bd1dd6d8e1623675bf5e899f32d74d6d8312f8dd125a084543193de"
 
 // installWix fetches and installs the wix toolkit to the specified path.
 func installWix(path string) error {
@@ -249,6 +309,12 @@ func installWix(path string) error {
 	body, err := httpGet(wixBinaries)
 	if err != nil {
 		return err
+	}
+
+	// Verify sha256
+	sum := sha256.Sum256(body)
+	if fmt.Sprintf("%x", sum) != wixSha256 {
+		return errors.New("sha256 mismatch for wix toolkit")
 	}
 
 	// Unzip to path.
@@ -319,7 +385,8 @@ func cp(dst, src string) error {
 	if err != nil {
 		return err
 	}
-	df, err := os.Create(dst)
+	tmpDst := dst + ".tmp"
+	df, err := os.Create(tmpDst)
 	if err != nil {
 		return err
 	}
@@ -331,7 +398,17 @@ func cp(dst, src string) error {
 		}
 	}
 	_, err = io.Copy(df, sf)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := df.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpDst, dst); err != nil {
+		return err
+	}
+	// Ensure the destination has the same mtime as the source.
+	return os.Chtimes(dst, fi.ModTime(), fi.ModTime())
 }
 
 func cpDir(dst, src string) error {
@@ -366,18 +443,41 @@ func ext() string {
 
 var versionRe = regexp.MustCompile(`^go(\d+(\.\d+)*)`)
 
-// The Microsoft installer requires version format major.minor.build
-// (http://msdn.microsoft.com/en-us/library/aa370859%28v=vs.85%29.aspx).
-// Where the major and minor field has a maximum value of 255 and build 65535.
-// The offical Go version format is goMAJOR.MINOR.PATCH at $GOROOT/VERSION.
-// It's based on the Mercurial tag. Remove prefix and suffix to make the
-// installer happy.
-func wixVersion(v string) string {
+// splitVersion splits a Go version string such as "go1.9" or "go1.10.2" (as matched by versionRe)
+// into its three parts: major, minor, and patch
+// It's based on the Git tag.
+func splitVersion(v string) (major, minor, patch int) {
 	m := versionRe.FindStringSubmatch(v)
 	if m == nil {
-		return "0.0.0"
+		return
 	}
-	return m[1]
+	parts := strings.Split(m[1], ".")
+	if len(parts) >= 1 {
+		major, _ = strconv.Atoi(parts[0])
+
+		if len(parts) >= 2 {
+			minor, _ = strconv.Atoi(parts[1])
+
+			if len(parts) >= 3 {
+				patch, _ = strconv.Atoi(parts[2])
+			}
+		}
+	}
+	return
+}
+
+// wixIsWinXPSupported checks if Windows XP
+// support is expected from the specified version.
+// (WinXP is no longer supported starting Go v1.11)
+func wixIsWinXPSupported(v string) bool {
+	major, minor, _ := splitVersion(v)
+	if major > 1 {
+		return false
+	}
+	if minor >= 11 {
+		return false
+	}
+	return true
 }
 
 const storageBase = "https://storage.googleapis.com/go-builder-data/release/"
@@ -449,7 +549,7 @@ function installCheck() {
 	    my.result.type = 'Warning';
 	    return false;
 	}
-    return true;    
+    return true;
 }
     </script>
     <choices-outline>
@@ -486,7 +586,7 @@ var windowsData = map[string]string{
 <?endif?>
 
 <Product
-    Id="FF5B30B2-08C2-11E1-85A2-6ACA4824019B"
+    Id="*"
     Name="Go Programming Language $(var.Arch) $(var.GoVersion)"
     Language="1033"
     Version="$(var.WixGoVersion)"
@@ -494,7 +594,7 @@ var windowsData = map[string]string{
     UpgradeCode="$(var.UpgradeCode)" >
 
 <Package
-    Id='*' 
+    Id='*'
     Keywords='Installer'
     Description="The Go Programming Language Installer"
     Comments="The Go programming language is an open source project to make programmers more productive."
@@ -502,7 +602,6 @@ var windowsData = map[string]string{
     Compressed="yes"
     InstallScope="perMachine"
     Languages="1033" />
-    <!--    Platform="x86 or x64" -->
 
 <Property Id="ARPCOMMENTS" Value="The Go programming language is a fast, statically typed, compiled language that feels like a dynamically typed, interpreted language." />
 <Property Id="ARPCONTACT" Value="golang-nuts@googlegroups.com" />
@@ -512,8 +611,19 @@ var windowsData = map[string]string{
 <Property Id="LicenseAccepted">1</Property>
 <Icon Id="gopher.ico" SourceFile="images\gopher.ico"/>
 <Property Id="ARPPRODUCTICON" Value="gopher.ico" />
+<Property Id="EXISTING_GOLANG_INSTALLED">
+  <RegistrySearch Id="installed" Type="raw" Root="HKCU" Key="Software\GoProgrammingLanguage" Name="installed" />
+</Property>
 <Media Id='1' Cabinet="go.cab" EmbedCab="yes" CompressionLevel="high" />
-<Condition Message="Windows 2000 or greater required."> VersionNT >= 500</Condition>
+<?if $(var.IsWinXPSupported) = true ?>
+    <Condition Message="Windows XP (with Service Pack 2) or greater required.">
+        (VersionNT >= 501 AND (WindowsBuild > 2600 OR ServicePackLevel >= 2))
+    </Condition>
+<?else?>
+    <Condition Message="Windows 7 (with Service Pack 1) or greater required.">
+        ((VersionNT > 601) OR (VersionNT = 601 AND ServicePackLevel >= 1))
+    </Condition>
+<?endif?>
 <MajorUpgrade AllowDowngrades="yes" />
 <SetDirectory Id="INSTALLDIRROOT" Value="[%SYSTEMDRIVE]"/>
 
@@ -559,19 +669,18 @@ var windowsData = map[string]string{
         Root="HKCU"
         Key="Software\GoProgrammingLanguage"
         Name="ShortCuts"
-        Type="integer" 
+        Type="integer"
         Value="1"
-        KeyPath="yes" /> 
+        KeyPath="yes" />
   </Component>
 </DirectoryRef>
 
 <!-- Registry & Environment Settings -->
 <DirectoryRef Id="GoEnvironmentEntries">
   <Component Id="Component_GoEnvironment" Guid="{3ec7a4d5-eb08-4de7-9312-2df392c45993}">
-    <RegistryKey 
+    <RegistryKey
         Root="HKCU"
-        Key="Software\GoProgrammingLanguage"
-        Action="create" >
+        Key="Software\GoProgrammingLanguage">
             <RegistryValue
                 Name="installed"
                 Type="integer"
@@ -598,6 +707,19 @@ var windowsData = map[string]string{
         Permanent="no"
         System="yes"
         Value="[INSTALLDIR]" />
+    <Environment
+        Id="UserGoPath"
+        Action="create"
+        Name="GOPATH"
+        Permanent="no"
+        Value="%USERPROFILE%\go" />
+    <Environment
+        Id="UserGoPathEntry"
+        Action="set"
+        Part="last"
+        Name="PATH"
+        Permanent="no"
+        Value="%USERPROFILE%\go\bin" />
     <RemoveFolder
         Id="GoEnvironmentEntries"
         On="uninstall" />
@@ -619,14 +741,95 @@ var windowsData = map[string]string{
     <Custom Action="SetApplicationRootDirectory" Before="InstallFinalize" />
 </InstallExecuteSequence>
 
+<!-- Notify top level applications of the new PATH variable (golang.org/issue/18680)  -->
+<CustomActionRef Id="WixBroadcastEnvironmentChange" />
+
 <!-- Include the user interface -->
 <WixVariable Id="WixUILicenseRtf" Value="LICENSE.rtf" />
 <WixVariable Id="WixUIBannerBmp" Value="images\Banner.jpg" />
 <WixVariable Id="WixUIDialogBmp" Value="images\Dialog.jpg" />
 <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR" />
-<UIRef Id="WixUI_InstallDir" />
+<UIRef Id="Golang_InstallDir" />
+<UIRef Id="WixUI_ErrorProgressText" />
 
 </Product>
+<Fragment>
+  <!--
+    The installer steps are modified so we can get user confirmation to uninstall an existing golang installation.
+
+    WelcomeDlg  [not installed]  =>                  LicenseAgreementDlg => InstallDirDlg  ..
+                [installed]      => OldVersionDlg => LicenseAgreementDlg => InstallDirDlg  ..
+  -->
+  <UI Id="Golang_InstallDir">
+    <!-- style -->
+    <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+    <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+    <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+
+    <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+    <Property Id="WixUI_Mode" Value="InstallDir" />
+
+    <!-- dialogs -->
+    <DialogRef Id="BrowseDlg" />
+    <DialogRef Id="DiskCostDlg" />
+    <DialogRef Id="ErrorDlg" />
+    <DialogRef Id="FatalError" />
+    <DialogRef Id="FilesInUse" />
+    <DialogRef Id="MsiRMFilesInUse" />
+    <DialogRef Id="PrepareDlg" />
+    <DialogRef Id="ProgressDlg" />
+    <DialogRef Id="ResumeDlg" />
+    <DialogRef Id="UserExit" />
+    <Dialog Id="OldVersionDlg" Width="240" Height="95" Title="[ProductName] Setup" NoMinimize="yes">
+      <Control Id="Text" Type="Text" X="28" Y="15" Width="194" Height="50">
+        <Text>A previous version of Go Programming Language is currently installed. By continuing the installation this version will be uninstalled. Do you want to continue?</Text>
+      </Control>
+      <Control Id="Exit" Type="PushButton" X="123" Y="67" Width="62" Height="17"
+        Default="yes" Cancel="yes" Text="No, Exit">
+        <Publish Event="EndDialog" Value="Exit">1</Publish>
+      </Control>
+      <Control Id="Next" Type="PushButton" X="55" Y="67" Width="62" Height="17" Text="Yes, Uninstall">
+        <Publish Event="EndDialog" Value="Return">1</Publish>
+      </Control>
+    </Dialog>
+
+    <!-- wizard steps -->
+    <Publish Dialog="BrowseDlg" Control="OK" Event="DoAction" Value="WixUIValidatePath" Order="3">1</Publish>
+    <Publish Dialog="BrowseDlg" Control="OK" Event="SpawnDialog" Value="InvalidDirDlg" Order="4"><![CDATA[NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID<>"1"]]></Publish>
+
+    <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
+
+    <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="OldVersionDlg"><![CDATA[EXISTING_GOLANG_INSTALLED << "#1"]]> </Publish>
+    <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg"><![CDATA[NOT (EXISTING_GOLANG_INSTALLED << "#1")]]></Publish>
+
+    <Publish Dialog="OldVersionDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg">1</Publish>
+
+    <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg">1</Publish>
+    <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg">LicenseAccepted = "1"</Publish>
+
+    <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg">1</Publish>
+    <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
+    <Publish Dialog="InstallDirDlg" Control="Next" Event="DoAction" Value="WixUIValidatePath" Order="2">NOT WIXUI_DONTVALIDATEPATH</Publish>
+    <Publish Dialog="InstallDirDlg" Control="Next" Event="SpawnDialog" Value="InvalidDirDlg" Order="3"><![CDATA[NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID<>"1"]]></Publish>
+    <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4">WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID="1"</Publish>
+    <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
+    <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2">1</Publish>
+
+    <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1">NOT Installed</Publish>
+    <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2">Installed AND NOT PATCH</Publish>
+    <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">Installed AND PATCH</Publish>
+
+    <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
+
+    <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+    <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+    <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg">1</Publish>
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+  </UI>
+
+  <UIRef Id="WixUI_Common" />
+</Fragment>
 </Wix>
 `,
 
@@ -635,4 +838,43 @@ var windowsData = map[string]string{
 	"images/Dialog.jpg":     storageBase + "windows/Dialog.jpg",
 	"images/DialogLeft.jpg": storageBase + "windows/DialogLeft.jpg",
 	"images/gopher.ico":     storageBase + "windows/gopher.ico",
+}
+
+// runSelfTests contains the tests for this file, since this file is
+// +build ignore. This is called by releaselet_test.go with an
+// environment variable set, which func main above recognizes.
+func runSelfTests() {
+	// Test splitVersion.
+	for _, tt := range []struct {
+		v                   string
+		major, minor, patch int
+	}{
+		{"go1", 1, 0, 0},
+		{"go1.34", 1, 34, 0},
+		{"go1.34.7", 1, 34, 7},
+	} {
+		major, minor, patch := splitVersion(tt.v)
+		if major != tt.major || minor != tt.minor || patch != tt.patch {
+			log.Fatalf("splitVersion(%q) = %v, %v, %v; want %v, %v, %v",
+				tt.v, major, minor, patch, tt.major, tt.minor, tt.patch)
+		}
+	}
+
+	// Test wixIsWinXPSupported
+	for _, tt := range []struct {
+		v    string
+		want bool
+	}{
+		{"go1.9", true},
+		{"go1.10", true},
+		{"go1.11", false},
+		{"go1.12", false},
+	} {
+		got := wixIsWinXPSupported(tt.v)
+		if got != tt.want {
+			log.Fatalf("wixIsWinXPSupported(%q) = %v; want %v", tt.v, got, tt.want)
+		}
+	}
+
+	fmt.Println("ok")
 }

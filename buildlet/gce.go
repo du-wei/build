@@ -5,16 +5,21 @@
 package buildlet
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/build/buildenv"
 	"golang.org/x/build/dashboard"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v1"
 )
 
@@ -30,10 +35,13 @@ func apiGate() {
 
 // VMOpts control how new VMs are started.
 type VMOpts struct {
-	// Zone is the GCE zone to create the VM in. Required.
+	// Zone is the GCE zone to create the VM in.
+	// Optional; defaults to provided build environment's zone.
 	Zone string
 
-	// ProjectID is the GCE project ID. Required.
+	// ProjectID is the GCE project ID (e.g. "foo-bar-123", not
+	// the numeric ID).
+	// Optional; defaults to provided build environment's project ID ("name").
 	ProjectID string
 
 	// TLS optionally specifies the TLS keypair to use.
@@ -47,8 +55,9 @@ type VMOpts struct {
 	Meta map[string]string
 
 	// DeleteIn optionally specifies a duration at which
-
 	// to delete the VM.
+	// If zero, a reasonable default is used.
+	// Negative means no deletion timeout.
 	DeleteIn time.Duration
 
 	// OnInstanceRequested optionally specifies a hook to run synchronously
@@ -64,21 +73,41 @@ type VMOpts struct {
 	// after the computeService.Instances.Get call.
 	OnGotInstanceInfo func()
 
-	// FallbackToFullPrice optionally specifies a hook to return a new
-	// GCE instance name if the first one failed to launch
-	// as preemptible. (If you use the same name, GCE complains about
-	// resources already existing, even if it failed to be created)
-	FallbackToFullPrice func() (newInstname string)
+	// OnBeginBuildletProbe optionally specifies a hook to run synchronously
+	// before StartNewVM tries to hit buildletURL to see if it's up yet.
+	OnBeginBuildletProbe func(buildletURL string)
+
+	// OnEndBuildletProbe optionally specifies a hook to run synchronously
+	// after StartNewVM tries to hit the buildlet's URL to see if it's up.
+	// The hook parameters are the return values from http.Get.
+	OnEndBuildletProbe func(*http.Response, error)
 }
 
 // StartNewVM boots a new VM on GCE and returns a buildlet client
 // configured to speak to it.
-func StartNewVM(ts oauth2.TokenSource, instName, builderType string, opts VMOpts) (*Client, error) {
-	computeService, _ := compute.New(oauth2.NewClient(oauth2.NoContext, ts))
+func StartNewVM(creds *google.Credentials, buildEnv *buildenv.Environment, instName, hostType string, opts VMOpts) (*Client, error) {
+	ctx := context.TODO()
+	computeService, _ := compute.New(oauth2.NewClient(ctx, creds.TokenSource))
 
-	conf, ok := dashboard.Builders[builderType]
+	if opts.Description == "" {
+		opts.Description = fmt.Sprintf("Go Builder for %s", hostType)
+	}
+	if opts.ProjectID == "" {
+		opts.ProjectID = buildEnv.ProjectName
+	}
+	if opts.Zone == "" {
+		opts.Zone = buildEnv.Zone
+	}
+	if opts.DeleteIn == 0 {
+		opts.DeleteIn = 30 * time.Minute
+	}
+
+	hconf, ok := dashboard.Hosts[hostType]
 	if !ok {
-		return nil, fmt.Errorf("invalid builder type %q", builderType)
+		return nil, fmt.Errorf("invalid host type %q", hostType)
+	}
+	if !hconf.IsVM() && !hconf.IsContainer() {
+		return nil, fmt.Errorf("host %q is type %q; want either a VM or container type", hostType, hconf.PoolName())
 	}
 
 	zone := opts.Zone
@@ -92,12 +121,10 @@ func StartNewVM(ts oauth2.TokenSource, instName, builderType string, opts VMOpts
 		return nil, errors.New("buildlet: missing required ProjectID option")
 	}
 
-	usePreempt := false
-Try:
 	prefix := "https://www.googleapis.com/compute/v1/projects/" + projectID
-	machType := prefix + "/zones/" + zone + "/machineTypes/" + conf.MachineType()
+	machType := prefix + "/zones/" + zone + "/machineTypes/" + hconf.MachineType()
 	diskType := "https://www.googleapis.com/compute/v1/projects/" + projectID + "/zones/" + zone + "/diskTypes/pd-ssd"
-	if conf.RegularDisk {
+	if hconf.RegularDisk {
 		diskType = "" // a spinning disk
 	}
 
@@ -114,10 +141,35 @@ Try:
 		}
 	}
 
+	srcImage := "https://www.googleapis.com/compute/v1/projects/" + projectID + "/global/images/" + hconf.VMImage
+	minCPU := hconf.MinCPUPlatform
+	if hconf.IsContainer() {
+		if hconf.NestedVirt {
+			minCPU = "Intel Haswell" // documented minimum from https://cloud.google.com/compute/docs/instances/enable-nested-virtualization-vm-instances
+			// TODO: use some variant of cosImage that finds our local
+			// forked copy of cos-stable with the VMX license added. For
+			// now, I just manually once ran:
+			//   gcloud compute images create cos-stable-72-11316-136-0-vmx --source-image=cos-stable-72-11316-136-0 --source-image-project=cos-cloud --licenses=https://www.googleapis.com/compute/v1/projects/vm-options/global/licenses/enable-vmx
+			// And we'll use that version for now. Perhaps when Nested
+			// Virtualization reaches GA it'll just become a boolean we
+			// can set in our compute.Instance creation request and this
+			// license opt-in mechanism will be unnecessary.
+			const coxVMXImage = "cos-stable-72-11316-136-0-vmx"
+			srcImage = "https://www.googleapis.com/compute/v1/projects/" + projectID + "/global/images/" + coxVMXImage
+		} else {
+			var err error
+			srcImage, err = cosImage(ctx, computeService)
+			if err != nil {
+				return nil, fmt.Errorf("error find Container-Optimized OS image: %v", err)
+			}
+		}
+	}
+
 	instance := &compute.Instance{
-		Name:        instName,
-		Description: opts.Description,
-		MachineType: machType,
+		Name:           instName,
+		Description:    opts.Description,
+		MachineType:    machType,
+		MinCpuPlatform: minCPU,
 		Disks: []*compute.AttachedDisk{
 			{
 				AutoDelete: true,
@@ -125,7 +177,7 @@ Try:
 				Type:       "PERSISTENT",
 				InitializeParams: &compute.AttachedDiskInitializeParams{
 					DiskName:    instName,
-					SourceImage: "https://www.googleapis.com/compute/v1/projects/" + projectID + "/global/images/" + conf.VMImage,
+					SourceImage: srcImage,
 					DiskType:    diskType,
 				},
 			},
@@ -144,10 +196,32 @@ Try:
 				Network:       prefix + "/global/networks/default",
 			},
 		},
-		Scheduling: &compute.Scheduling{
-			Preemptible: usePreempt,
-		},
+
+		// Prior to git rev 1b1e086fd, we used preemptible
+		// instances, as we were helping test the feature. It was
+		// removed after git rev a23395d because we hadn't been
+		// using it for some time. Our VMs are so short-lived that
+		// the feature doesn't really help anyway. But if we ever
+		// find we want it again, this comment is here to point to
+		// code that might be useful to partially resurrect.
+		Scheduling: &compute.Scheduling{Preemptible: false},
 	}
+
+	// Container builders use the COS image, which defaults to
+	// logging to Cloud Logging, which requires the default
+	// service account. So enable it when needed.
+	// TODO: reduce this scope in the future, when we go wild with IAM.
+	if hconf.IsContainer() {
+		instance.ServiceAccounts = []*compute.ServiceAccount{
+			{
+				// This funky email address is the
+				// "default service account" for GCE VMs:
+				Email:  fmt.Sprintf("%v-compute@developer.gserviceaccount.com", buildEnv.ProjectNumber),
+				Scopes: []string{compute.CloudPlatformScope},
+			},
+		}
+	}
+
 	addMeta := func(key, value string) {
 		instance.Metadata.Items = append(instance.Metadata.Items, &compute.MetadataItems{
 			Key:   key,
@@ -158,15 +232,34 @@ Try:
 	// which the VMs are configured to download at boot and run.
 	// This lets us/ update the buildlet more easily than
 	// rebuilding the whole VM image.
-	addMeta("buildlet-binary-url", conf.BuildletBinaryURL())
-	addMeta("builder-type", builderType)
+	addMeta("buildlet-binary-url", hconf.BuildletBinaryURL(buildenv.ByProjectID(opts.ProjectID)))
+	addMeta("buildlet-host-type", hostType)
 	if !opts.TLS.IsZero() {
 		addMeta("tls-cert", opts.TLS.CertPEM)
 		addMeta("tls-key", opts.TLS.KeyPEM)
 		addMeta("password", opts.TLS.Password())
 	}
+	if hconf.IsContainer() {
+		addMeta("gce-container-declaration", fmt.Sprintf(`spec:
+  containers:
+    - name: buildlet
+      image: 'gcr.io/%s/%s'
+      volumeMounts:
+        - name: tmpfs-0
+          mountPath: /workdir
+      securityContext:
+        privileged: true
+      stdin: false
+      tty: false
+  restartPolicy: Always
+  volumes:
+    - name: tmpfs-0
+      emptyDir:
+        medium: Memory
+`, opts.ProjectID, hconf.ContainerImage))
+	}
 
-	if opts.DeleteIn != 0 {
+	if opts.DeleteIn > 0 {
 		// In case the VM gets away from us (generally: if the
 		// coordinator dies while a build is running), then we
 		// set this attribute of when it should be killed so
@@ -204,13 +297,6 @@ OpLoop:
 			if op.Error != nil {
 				for _, operr := range op.Error.Errors {
 					log.Printf("failed to create instance %s in zone %s: %v", instName, zone, operr.Code)
-					if operr.Code == "ZONE_RESOURCE_POOL_EXHAUSTED" && usePreempt && opts.FallbackToFullPrice != nil {
-						oldName := instName
-						usePreempt = false
-						instName = opts.FallbackToFullPrice()
-						log.Printf("buildlet/gce: retrying without preempt with name %q (previously: %q)", instName, oldName)
-						goto Try
-					}
 					// TODO: catch Code=="QUOTA_EXCEEDED" and "Message" and return
 					// a known error value/type.
 					return nil, fmt.Errorf("Error creating instance: %+v", operr)
@@ -251,7 +337,7 @@ OpLoop:
 	}
 	condRun(opts.OnGotInstanceInfo)
 
-	const timeout = 3 * time.Minute
+	const timeout = 5 * time.Minute
 	var alive bool
 	impatientClient := &http.Client{
 		Timeout: 5 * time.Second,
@@ -267,7 +353,13 @@ OpLoop:
 	try := 0
 	for time.Now().Before(deadline) {
 		try++
+		if fn := opts.OnBeginBuildletProbe; fn != nil {
+			fn(buildletURL)
+		}
 		res, err := impatientClient.Get(buildletURL)
+		if fn := opts.OnEndBuildletProbe; fn != nil {
+			fn(res, err)
+		}
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
@@ -290,7 +382,7 @@ OpLoop:
 // currently (2015-01-19) very slow for no good reason. This function
 // returns once it's been requested, not when it's done.
 func DestroyVM(ts oauth2.TokenSource, proj, zone, instance string) error {
-	computeService, _ := compute.New(oauth2.NewClient(oauth2.NoContext, ts))
+	computeService, _ := compute.New(oauth2.NewClient(context.TODO(), ts))
 	apiGate()
 	_, err := computeService.Instances.Delete(proj, zone, instance).Do()
 	return err
@@ -303,13 +395,13 @@ type VM struct {
 	Name   string
 	IPPort string
 	TLS    KeyPair
-	Type   string
+	Type   string // buildlet type
 }
 
 // ListVMs lists all VMs.
 func ListVMs(ts oauth2.TokenSource, proj, zone string) ([]VM, error) {
 	var vms []VM
-	computeService, _ := compute.New(oauth2.NewClient(oauth2.NoContext, ts))
+	computeService, _ := compute.New(oauth2.NewClient(context.TODO(), ts))
 
 	// TODO(bradfitz): paging over results if more than 500
 	apiGate()
@@ -328,13 +420,13 @@ func ListVMs(ts oauth2.TokenSource, proj, zone string) ([]VM, error) {
 				meta[it.Key] = *it.Value
 			}
 		}
-		builderType := meta["builder-type"]
-		if builderType == "" {
+		hostType := meta["buildlet-host-type"]
+		if hostType == "" {
 			continue
 		}
 		vm := VM{
 			Name: inst.Name,
-			Type: builderType,
+			Type: hostType,
 			TLS: KeyPair{
 				CertPEM: meta["tls-cert"],
 				KeyPEM:  meta["tls-key"],
@@ -362,4 +454,44 @@ func instanceIPs(inst *compute.Instance) (intIP, extIP string) {
 		}
 	}
 	return
+}
+
+var (
+	cosListMu      sync.Mutex
+	cosCachedTime  time.Time
+	cosCachedImage string
+)
+
+// cosImage returns the GCP VM image name of the latest stable
+// Container-Optimized OS image. It caches results for 15 minutes.
+func cosImage(ctx context.Context, svc *compute.Service) (string, error) {
+	const cacheDuration = 15 * time.Minute
+	cosListMu.Lock()
+	defer cosListMu.Unlock()
+	if cosCachedImage != "" && cosCachedTime.After(time.Now().Add(-cacheDuration)) {
+		return cosCachedImage, nil
+	}
+
+	imList, err := svc.Images.List("cos-cloud").Filter(`(family eq "cos-stable")`).Context(ctx).Do()
+	if err != nil {
+		return "", err
+	}
+	if imList.NextPageToken != "" {
+		return "", fmt.Errorf("too many images; pagination not supported")
+	}
+	ims := imList.Items
+	if len(ims) == 0 {
+		return "", errors.New("no image found")
+	}
+	sort.Slice(ims, func(i, j int) bool {
+		if ims[i].Deprecated == nil && ims[j].Deprecated != nil {
+			return true
+		}
+		return ims[i].CreationTimestamp > ims[j].CreationTimestamp
+	})
+
+	im := ims[0].SelfLink
+	cosCachedImage = im
+	cosCachedTime = time.Now()
+	return im, nil
 }

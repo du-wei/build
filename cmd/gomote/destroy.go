@@ -13,7 +13,7 @@ import (
 func destroy(args []string) error {
 	fs := flag.NewFlagSet("destroy", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "create usage: gomote destroy <instance>")
+		fmt.Fprintln(os.Stderr, "destroy usage: gomote destroy <instance>")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -23,7 +23,7 @@ func destroy(args []string) error {
 		fs.Usage()
 	}
 	name := fs.Arg(0)
-	bc, err := namedClient(name)
+	bc, _, err := clientAndConf(name)
 	if err != nil {
 		return err
 	}

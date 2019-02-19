@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package build contains constants for the Go continous build system.
+// Package build contains constants for the Go continuous build system.
 package build
 
 import (
@@ -40,6 +40,11 @@ func (ci CoordinatorInstance) TLSHostPort() (string, error) {
 }
 
 func (ci CoordinatorInstance) TLSDialer() func(network, addr string) (net.Conn, error) {
+	if ci == "prod" {
+		// TODO(bradfitz): once the staging coordinator has a
+		// DNS name and LetsEncrypt, delete this whole method?
+		return nil // uses default http.Transport.DialTLS dialer
+	}
 	caPool := x509.NewCertPool()
 	tlsConf := &tls.Config{
 		ServerName:         "go", // fixed name; see build.go

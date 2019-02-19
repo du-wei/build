@@ -13,8 +13,8 @@ import (
 func rm(args []string) error {
 	fs := flag.NewFlagSet("rm", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "create usage: gomote rm <instance> <file-or-dir>+")
-		fmt.Fprintln(os.Stderr, "              gomote rm <instance> .  (to delete everything)")
+		fmt.Fprintln(os.Stderr, "rm usage: gomote rm <instance> <file-or-dir>+")
+		fmt.Fprintln(os.Stderr, "          gomote rm <instance> .  (to delete everything)")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -25,7 +25,7 @@ func rm(args []string) error {
 	}
 	name := fs.Arg(0)
 	args = fs.Args()[1:]
-	bc, err := namedClient(name)
+	bc, _, err := clientAndConf(name)
 	if err != nil {
 		return err
 	}

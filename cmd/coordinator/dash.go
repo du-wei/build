@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// +build linux
+
 // Code interacting with build.golang.org ("the dashboard").
 
 package main
@@ -22,17 +24,10 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/cloud/compute/metadata"
-)
+	"golang.org/x/build/internal/buildgo"
 
-// dashBase returns the base URL of the build dashboard.
-// It must be called after initGCE (so not at init time).
-func dashBase() string {
-	if inStaging {
-		return "https://go-dashboard-dev.appspot.com/"
-	}
-	return "https://build.golang.org/"
-}
+	"cloud.google.com/go/compute/metadata"
+)
 
 // dash is copied from the builder binary. It runs the given method and command on the dashboard.
 //
@@ -53,7 +48,7 @@ func dash(meth, cmd string, args url.Values, req, resp interface{}) error {
 	}
 	var r *http.Response
 	var err error
-	cmd = dashBase() + cmd + "?" + argsCopy.Encode()
+	cmd = buildEnv.DashBase() + cmd + "?" + argsCopy.Encode()
 	switch meth {
 	case "GET":
 		if req != nil {
@@ -88,47 +83,48 @@ func dash(meth, cmd string, args url.Values, req, resp interface{}) error {
 
 	// Read JSON-encoded Response into provided resp
 	// and return an error if present.
-	var result = struct {
-		Response interface{}
-		Error    string
-	}{
-		// Put the provided resp in here as it can be a pointer to
-		// some value we should unmarshal into.
-		Response: resp,
-	}
-	if err = json.Unmarshal(body.Bytes(), &result); err != nil {
+	if err = json.Unmarshal(body.Bytes(), resp); err != nil {
 		log.Printf("json unmarshal %#q: %s\n", body.Bytes(), err)
 		return err
-	}
-	if result.Error != "" {
-		return errors.New(result.Error)
 	}
 
 	return nil
 }
 
-// recordResult sends build results to the dashboard
-func recordResult(br builderRev, ok bool, buildLog string, runTime time.Duration) error {
+// recordResult sends build results to the dashboard.
+// This is not used for trybot failures; only failures after commit.
+// The URLs end up looking like https://build.golang.org/log/$HEXDIGEST
+func recordResult(br buildgo.BuilderRev, ok bool, buildLog string, runTime time.Duration) error {
 	req := map[string]interface{}{
-		"Builder":     br.name,
+		"Builder":     br.Name,
 		"PackagePath": "",
-		"Hash":        br.rev,
+		"Hash":        br.Rev,
 		"GoHash":      "",
 		"OK":          ok,
 		"Log":         buildLog,
 		"RunTime":     runTime,
 	}
-	if br.isSubrepo() {
-		req["PackagePath"] = subrepoPrefix + br.subName
-		req["Hash"] = br.subRev
-		req["GoHash"] = br.rev
+	if br.IsSubrepo() {
+		req["PackagePath"] = subrepoPrefix + br.SubName
+		req["Hash"] = br.SubRev
+		req["GoHash"] = br.Rev
 	}
-	args := url.Values{"key": {builderKey(br.name)}, "builder": {br.name}}
+	args := url.Values{"key": {builderKey(br.Name)}, "builder": {br.Name}}
 	if *mode == "dev" {
 		log.Printf("In dev mode, not recording result: %v", req)
 		return nil
 	}
-	return dash("POST", "result", args, req, nil)
+	var result struct {
+		Response interface{}
+		Error    string
+	}
+	if err := dash("POST", "result", args, req, &result); err != nil {
+		return err
+	}
+	if result.Error != "" {
+		return errors.New(result.Error)
+	}
+	return nil
 }
 
 // pingDashboard runs in its own goroutine, created periodically to
@@ -146,16 +142,16 @@ func (st *buildStatus) pingDashboard() {
 	logsURL := st.logsURLLocked()
 	st.mu.Unlock()
 	args := url.Values{
-		"builder": []string{st.name},
-		"key":     []string{builderKey(st.name)},
-		"hash":    []string{st.rev},
+		"builder": []string{st.Name},
+		"key":     []string{builderKey(st.Name)},
+		"hash":    []string{st.Rev},
 		"url":     []string{logsURL},
 	}
-	if st.isSubrepo() {
-		args.Set("hash", st.subRev)
-		args.Set("gohash", st.rev)
+	if st.IsSubrepo() {
+		args.Set("hash", st.SubRev)
+		args.Set("gohash", st.Rev)
 	}
-	u := dashBase() + "building?" + args.Encode()
+	u := buildEnv.DashBase() + "building?" + args.Encode()
 	for {
 		st.mu.Lock()
 		done := st.done

@@ -16,7 +16,7 @@ import (
 func ls(args []string) error {
 	fs := flag.NewFlagSet("ls", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "create usage: gomote ls <instance> [-R] [dir]")
+		fmt.Fprintln(os.Stderr, "ls usage: gomote ls <instance> [-R] [dir]")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -35,7 +35,7 @@ func ls(args []string) error {
 		dir = fs.Arg(1)
 	}
 	name := fs.Arg(0)
-	bc, err := namedClient(name)
+	bc, _, err := clientAndConf(name)
 	if err != nil {
 		return err
 	}

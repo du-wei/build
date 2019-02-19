@@ -8,32 +8,31 @@ package kubernetes
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"golang.org/x/build/kubernetes/api"
-	"golang.org/x/net/context"
 	"golang.org/x/net/context/ctxhttp"
-)
-
-const (
-	// APIEndpoint defines the base path for kubernetes API resources.
-	APIEndpoint     = "/api/v1"
-	defaultPod      = "/namespaces/default/pods"
-	defaultWatchPod = "/watch/namespaces/default/pods"
-	nodes           = "/nodes"
 )
 
 // Client is a client for the Kubernetes master.
 type Client struct {
+	httpClient *http.Client
+
+	// endPointURL is the Kubernetes master URL ending in
+	// "/api/v1".
 	endpointURL string
-	httpClient  *http.Client
+
+	namespace string // always in URL path-escaped form (for now)
 }
 
 // NewClient returns a new Kubernetes client.
@@ -46,23 +45,40 @@ func NewClient(baseURL string, client *http.Client) (*Client, error) {
 		return nil, fmt.Errorf("failed to parse URL %q: %v", baseURL, err)
 	}
 	return &Client{
-		endpointURL: strings.TrimSuffix(validURL.String(), "/") + APIEndpoint,
+		endpointURL: strings.TrimSuffix(validURL.String(), "/") + "/api/v1",
 		httpClient:  client,
+		namespace:   "default",
 	}, nil
 }
 
-// Run creates a new pod resource in the default pod namespace with
-// the given pod API specification.
+// Close closes any idle HTTP connections still connected to the Kubernetes master.
+func (c *Client) Close() error {
+	if tr, ok := c.httpClient.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+	return nil
+}
+
+// nsEndpoint returns the API endpoint root for this client.
+// (This has nothing to do with Service Endpoints.)
+func (c *Client) nsEndpoint() string {
+	return c.endpointURL + "/namespaces/" + c.namespace + "/"
+}
+
+// RunLongLivedPod creates a new pod resource in the default pod namespace with
+// the given pod API specification. It assumes the pod runs a
+// long-lived server (i.e. if the container exit quickly quickly, even
+// with success, then that is an error).
+//
 // It returns the pod status once it has entered the Running phase.
-// An error is returned if the pod can not be created, if it does
-// does not enter the running phase within 2 minutes, or if ctx.Done
+// An error is returned if the pod can not be created, or if ctx.Done
 // is closed.
-func (c *Client) RunPod(ctx context.Context, pod *api.Pod) (*api.Pod, error) {
+func (c *Client) RunLongLivedPod(ctx context.Context, pod *api.Pod) (*api.PodStatus, error) {
 	var podJSON bytes.Buffer
 	if err := json.NewEncoder(&podJSON).Encode(pod); err != nil {
 		return nil, fmt.Errorf("failed to encode pod in json: %v", err)
 	}
-	postURL := c.endpointURL + defaultPod
+	postURL := c.nsEndpoint() + "pods"
 	req, err := http.NewRequest("POST", postURL, &podJSON)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: POST %q : %v", postURL, err)
@@ -83,54 +99,120 @@ func (c *Client) RunPod(ctx context.Context, pod *api.Pod) (*api.Pod, error) {
 	if err := json.Unmarshal(body, &podResult); err != nil {
 		return nil, fmt.Errorf("failed to decode pod resources: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
 
-	createdPod, err := c.AwaitPodNotPending(ctx, podResult.Name, podResult.ObjectMeta.ResourceVersion)
+	for {
+		// TODO(bradfitz,evanbrown): pass podResult.ObjectMeta.ResourceVersion to PodStatus?
+		ps, err := c.PodStatus(ctx, podResult.Name)
+		if err != nil {
+			return nil, err
+		}
+		switch ps.Phase {
+		case api.PodPending:
+			// The main phase we're waiting on
+			break
+		case api.PodRunning:
+			return ps, nil
+		case api.PodSucceeded, api.PodFailed:
+			return nil, fmt.Errorf("pod entered phase %q", ps.Phase)
+		default:
+			log.Printf("RunLongLivedPod poll loop: pod %q in unexpected phase %q; sleeping", podResult.Name, ps.Phase)
+		}
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+			// The pod did not leave the pending
+			// state. Try to clean it up.
+			go c.DeletePod(context.Background(), podResult.Name)
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (c *Client) do(ctx context.Context, method, urlStr string, dst interface{}) error {
+	req, err := http.NewRequest(method, urlStr, nil)
 	if err != nil {
-		log.Printf("Timed out waiting for pod to leave pending state. Pod will be deleted.")
-		// The pod did not leave the pending state. We should try to manually delete it before
-		// returning an error.
-		c.DeletePod(context.Background(), createdPod.Name)
+		return err
+	}
+	res, err := ctxhttp.Do(ctx, c.httpClient, req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(res.Body)
+		return fmt.Errorf("%v %s: %v, %s", method, urlStr, res.Status, body)
+	}
+	if dst != nil {
+		var r io.Reader = res.Body
+		if false && strings.Contains(urlStr, "endpoints") { // for debugging
+			r = io.TeeReader(r, os.Stderr)
+		}
+		return json.NewDecoder(r).Decode(dst)
+	}
+	return nil
+}
+
+// GetServices returns all services in the cluster, regardless of status.
+func (c *Client) GetServices(ctx context.Context) ([]api.Service, error) {
+	var list api.ServiceList
+	if err := c.do(ctx, "GET", c.nsEndpoint()+"services", &list); err != nil {
 		return nil, err
 	}
-	return createdPod, nil
+	return list.Items, nil
+}
+
+// Endpoint represents a service endpoint address.
+type Endpoint struct {
+	IP       string
+	Port     int
+	PortName string
+	Protocol string // "TCP" or "UDP"; never empty
+}
+
+// GetServiceEndpoints returns the endpoints for the named service.
+// If portName is non-empty, only endpoints matching that port name are returned.
+func (c *Client) GetServiceEndpoints(ctx context.Context, serviceName, portName string) ([]Endpoint, error) {
+	var res api.Endpoints
+	// TODO: path escape serviceName?
+	if err := c.do(ctx, "GET", c.nsEndpoint()+"endpoints/"+serviceName, &res); err != nil {
+		return nil, err
+	}
+	var ep []Endpoint
+	for _, ss := range res.Subsets {
+		for _, port := range ss.Ports {
+			if portName != "" && port.Name != portName {
+				continue
+			}
+			for _, addr := range ss.Addresses {
+				proto := string(port.Protocol)
+				if proto == "" {
+					proto = "TCP"
+				}
+				ep = append(ep, Endpoint{
+					IP:       addr.IP,
+					Port:     port.Port,
+					PortName: port.Name,
+					Protocol: proto,
+				})
+			}
+		}
+	}
+	return ep, nil
 }
 
 // GetPods returns all pods in the cluster, regardless of status.
 func (c *Client) GetPods(ctx context.Context) ([]api.Pod, error) {
-	getURL := c.endpointURL + defaultPod
-
-	// Make request to Kubernetes API
-	req, err := http.NewRequest("GET", getURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: GET %q : %v", getURL, err)
+	var list api.PodList
+	if err := c.do(ctx, "GET", c.nsEndpoint()+"pods", &list); err != nil {
+		return nil, err
 	}
-	res, err := ctxhttp.Do(ctx, c.httpClient, req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make request: GET %q: %v", getURL, err)
-	}
-
-	body, err := ioutil.ReadAll(res.Body)
-	res.Body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read request body for GET %q: %v", getURL, err)
-	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http error %d GET %q: %q: %v", res.StatusCode, getURL, string(body), err)
-	}
-
-	var podList api.PodList
-	if err := json.Unmarshal(body, &podList); err != nil {
-		return nil, fmt.Errorf("failed to decode list of pod resources: %v", err)
-	}
-	return podList.Items, nil
+	return list.Items, nil
 }
 
 // PodDelete deletes the specified Kubernetes pod.
 func (c *Client) DeletePod(ctx context.Context, podName string) error {
-	url := c.endpointURL + defaultPod + "/" + podName
-	req, err := http.NewRequest("DELETE", url, nil)
+	url := c.nsEndpoint() + "pods/" + podName
+	req, err := http.NewRequest("DELETE", url, strings.NewReader(`{"gracePeriodSeconds":0}`))
 	if err != nil {
 		return fmt.Errorf("failed to create request: DELETE %q : %v", url, err)
 	}
@@ -141,7 +223,7 @@ func (c *Client) DeletePod(ctx context.Context, podName string) error {
 	body, err := ioutil.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
-		return fmt.Errorf("failed to read response body: DELETE %q: %v, url, err")
+		return fmt.Errorf("failed to read response body: DELETE %q: %v", url, err)
 	}
 	if res.StatusCode != http.StatusOK {
 		return fmt.Errorf("http error: %d DELETE %q: %q: %v", res.StatusCode, url, string(body), err)
@@ -149,30 +231,39 @@ func (c *Client) DeletePod(ctx context.Context, podName string) error {
 	return nil
 }
 
-// awaitPodNotPending will return a pod's status in a
+// TODO(bradfitz): WatchPod is unreliable, so this is disabled.
+//
+// AwaitPodNotPending will return a pod's status in a
 // podStatusResult when the pod is no longer in the pending
 // state.
 // The podResourceVersion is required to prevent a pod's entire
 // history from being retrieved when the watch is initiated.
 // If there is an error polling for the pod's status, or if
 // ctx.Done is closed, podStatusResult will contain an error.
-func (c *Client) AwaitPodNotPending(ctx context.Context, podName, podResourceVersion string) (*api.Pod, error) {
+func (c *Client) _AwaitPodNotPending(ctx context.Context, podName, podResourceVersion string) (*api.Pod, error) {
 	if podResourceVersion == "" {
 		return nil, fmt.Errorf("resourceVersion for pod %v must be provided", podName)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	podStatusResult, err := c.WatchPod(ctx, podName, podResourceVersion)
+	podStatusUpdates, err := c._WatchPod(ctx, podName, podResourceVersion)
 	if err != nil {
 		return nil, err
 	}
-	var psr PodStatusResult
 	for {
 		select {
-		case psr = <-podStatusResult:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case psr := <-podStatusUpdates:
 			if psr.Err != nil {
-				return nil, psr.Err
+				// If the context is done, prefer its error:
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+					return nil, psr.Err
+				}
 			}
 			if psr.Pod.Status.Phase != api.PodPending {
 				return psr.Pod, nil
@@ -181,7 +272,7 @@ func (c *Client) AwaitPodNotPending(ctx context.Context, podName, podResourceVer
 	}
 }
 
-// PodStatusResult wraps a api.PodStatus and error
+// PodStatusResult wraps an api.PodStatus and error.
 type PodStatusResult struct {
 	Pod  *api.Pod
 	Type string
@@ -195,6 +286,10 @@ type watchPodStatus struct {
 	Object api.Pod `json:"object"`
 }
 
+// TODO(bradfitz): WatchPod is unreliable and sometimes hangs forever
+// without closing and sometimes ends prematurely, so this API is
+// disabled.
+//
 // WatchPod long-polls the Kubernetes watch API to be notified
 // of changes to the specified pod. Changes are sent on the returned
 // PodStatusResult channel as they are received.
@@ -204,16 +299,19 @@ type watchPodStatus struct {
 // If any error occurs communicating with the Kubernetes API, the
 // error will be sent on the returned PodStatusResult channel and
 // it will be closed.
-func (c *Client) WatchPod(ctx context.Context, podName, podResourceVersion string) (<-chan PodStatusResult, error) {
+func (c *Client) _WatchPod(ctx context.Context, podName, podResourceVersion string) (<-chan PodStatusResult, error) {
 	if podResourceVersion == "" {
 		return nil, fmt.Errorf("resourceVersion for pod %v must be provided", podName)
 	}
-	statusChan := make(chan PodStatusResult)
+	statusChan := make(chan PodStatusResult, 1)
 
 	go func() {
 		defer close(statusChan)
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
 		// Make request to Kubernetes API
-		getURL := c.endpointURL + defaultWatchPod + "/" + podName
+		getURL := c.endpointURL + "/watch/namespaces/" + c.namespace + "/pods/" + podName
 		req, err := http.NewRequest("GET", getURL, nil)
 		req.URL.Query().Add("resourceVersion", podResourceVersion)
 		if err != nil {
@@ -221,13 +319,15 @@ func (c *Client) WatchPod(ctx context.Context, podName, podResourceVersion strin
 			return
 		}
 		res, err := ctxhttp.Do(ctx, c.httpClient, req)
-		defer res.Body.Close()
 		if err != nil {
-			statusChan <- PodStatusResult{Err: fmt.Errorf("failed to make request: GET %q: %v", getURL, err)}
+			statusChan <- PodStatusResult{Err: err}
 			return
 		}
-
-		var wps watchPodStatus
+		defer res.Body.Close()
+		if res.StatusCode != 200 {
+			statusChan <- PodStatusResult{Err: fmt.Errorf("WatchPod status %v", res.Status)}
+			return
+		}
 		reader := bufio.NewReader(res.Body)
 
 		// bufio.Reader.ReadBytes is blocking, so we watch for
@@ -240,16 +340,27 @@ func (c *Client) WatchPod(ctx context.Context, podName, podResourceVersion strin
 			res.Body.Close()
 		}()
 
+		const backupPollDuration = 30 * time.Second
+		backupPoller := time.AfterFunc(backupPollDuration, func() {
+			log.Printf("kubernetes: backup poller in WatchPod checking on %q", podName)
+			st, err := c.PodStatus(ctx, podName)
+			log.Printf("kubernetes: backup poller in WatchPod PodStatus(%q) = %v, %v", podName, st, err)
+			if err != nil {
+				// Some error.
+				cancel()
+			}
+		})
+		defer backupPoller.Stop()
+
 		for {
 			line, err := reader.ReadBytes('\n')
-			if ctx.Err() != nil {
-				statusChan <- PodStatusResult{Err: ctx.Err()}
-				return
-			}
+			log.Printf("kubernetes WatchPod status line of %q: %q, %v", podName, line, err)
+			backupPoller.Reset(backupPollDuration)
 			if err != nil {
 				statusChan <- PodStatusResult{Err: fmt.Errorf("error reading streaming response body: %v", err)}
 				return
 			}
+			var wps watchPodStatus
 			if err := json.Unmarshal(line, &wps); err != nil {
 				statusChan <- PodStatusResult{Err: fmt.Errorf("failed to decode watch pod status: %v", err)}
 				return
@@ -263,7 +374,7 @@ func (c *Client) WatchPod(ctx context.Context, podName, podResourceVersion strin
 // Retrieve the status of a pod synchronously from the Kube
 // API server.
 func (c *Client) PodStatus(ctx context.Context, podName string) (*api.PodStatus, error) {
-	getURL := c.endpointURL + defaultPod + "/" + podName
+	getURL := c.nsEndpoint() + "pods/" + podName // TODO: escape podName?
 
 	// Make request to Kubernetes API
 	req, err := http.NewRequest("GET", getURL, nil)
@@ -295,7 +406,7 @@ func (c *Client) PodStatus(ctx context.Context, podName string) (*api.PodStatus,
 // in the pod.
 func (c *Client) PodLog(ctx context.Context, podName string) (string, error) {
 	// TODO(evanbrown): support multiple containers
-	url := c.endpointURL + defaultPod + "/" + podName + "/log"
+	url := c.nsEndpoint() + "pods/" + podName + "/log" // TODO: escape podName?
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: GET %q : %v", url, err)
@@ -317,26 +428,9 @@ func (c *Client) PodLog(ctx context.Context, podName string) (string, error) {
 
 // PodNodes returns the list of nodes that comprise the Kubernetes cluster
 func (c *Client) GetNodes(ctx context.Context) ([]api.Node, error) {
-	url := c.endpointURL + nodes
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: GET %q : %v", url, err)
+	var list api.NodeList
+	if err := c.do(ctx, "GET", c.endpointURL+"/nodes", &list); err != nil {
+		return nil, err
 	}
-	res, err := ctxhttp.Do(ctx, c.httpClient, req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make request: GET %q: %v", url, err)
-	}
-	body, err := ioutil.ReadAll(res.Body)
-	res.Body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: GET %q: %v, url, err")
-	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http error %d GET %q: %q: %v", res.StatusCode, url, string(body), err)
-	}
-	var nodeList *api.NodeList
-	if err := json.Unmarshal(body, &nodeList); err != nil {
-		return nil, fmt.Errorf("failed to decode node list: %v", err)
-	}
-	return nodeList.Items, nil
+	return list.Items, nil
 }

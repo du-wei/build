@@ -5,6 +5,7 @@
 package buildlet
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -12,22 +13,26 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/build/buildenv"
 	"golang.org/x/build/dashboard"
 	"golang.org/x/build/kubernetes"
 	"golang.org/x/build/kubernetes/api"
-	"golang.org/x/net/context"
 	"golang.org/x/net/context/ctxhttp"
 )
 
 var (
 	// TODO(evanbrown): resource requirements should be
 	// defined per-builder in dashboard/builders.go
-	BuildletCPU    = api.MustParse("2")         // 2 Cores
-	BuildletMemory = api.MustParse("2000000Ki") // 2,000,000Ki RAM
+	BuildletCPU      = api.MustParse("2")         // 2 Cores
+	BuildletCPULimit = api.MustParse("8")         // 8 Cores
+	BuildletMemory   = api.MustParse("4000000Ki") // 4,000,000Ki RAM
 )
 
 // PodOpts control how new pods are started.
 type PodOpts struct {
+	// ProjectID is the GCE project ID. Required.
+	ProjectID string
+
 	// ImageRegistry specifies the Docker registry Kubernetes
 	// will use to create the pod. Required.
 	ImageRegistry string
@@ -47,21 +52,26 @@ type PodOpts struct {
 	// to delete the pod.
 	DeleteIn time.Duration
 
-	// OnPodCreated optionally specifies a hook to run synchronously
-	// after the pod operation succeeds.
-	OnPodCreated func()
+	// OnPodCreating optionally specifies a hook to run synchronously
+	// after the pod create request has been made, but before the create
+	// has succeeded.
+	OnPodCreating func()
 
 	// OnPodCreated optionally specifies a hook to run synchronously
+	// after the pod create request succeeds.
+	OnPodCreated func()
+
+	// OnGotPodInfo optionally specifies a hook to run synchronously
 	// after the pod Get call.
 	OnGotPodInfo func()
 }
 
 // StartPod creates a new pod on a Kubernetes cluster and returns a buildlet client
 // configured to speak to it.
-func StartPod(ctx context.Context, kubeClient *kubernetes.Client, podName, builderType string, opts PodOpts) (*Client, error) {
-	conf, ok := dashboard.Builders[builderType]
-	if !ok || conf.KubeImage == "" {
-		return nil, fmt.Errorf("invalid builder type %q", builderType)
+func StartPod(ctx context.Context, kubeClient *kubernetes.Client, podName, hostType string, opts PodOpts) (*Client, error) {
+	conf, ok := dashboard.Hosts[hostType]
+	if !ok || conf.ContainerImage == "" {
+		return nil, fmt.Errorf("invalid builder type %q", hostType)
 	}
 	pod := &api.Pod{
 		TypeMeta: api.TypeMeta{
@@ -72,7 +82,7 @@ func StartPod(ctx context.Context, kubeClient *kubernetes.Client, podName, build
 			Name: podName,
 			Labels: map[string]string{
 				"name": podName,
-				"type": builderType,
+				"type": hostType,
 				"role": "buildlet",
 			},
 			Annotations: map[string]string{},
@@ -82,11 +92,15 @@ func StartPod(ctx context.Context, kubeClient *kubernetes.Client, podName, build
 			Containers: []api.Container{
 				{
 					Name:            "buildlet",
-					Image:           imageID(opts.ImageRegistry, conf.KubeImage),
+					Image:           imageID(opts.ImageRegistry, conf.ContainerImage),
 					ImagePullPolicy: api.PullAlways,
 					Resources: api.ResourceRequirements{
-						Limits: api.ResourceList{
+						Requests: api.ResourceList{
 							api.ResourceCPU:    BuildletCPU,
+							api.ResourceMemory: BuildletMemory,
+						},
+						Limits: api.ResourceList{
+							api.ResourceCPU:    BuildletCPULimit,
 							api.ResourceMemory: BuildletMemory,
 						},
 					},
@@ -118,8 +132,8 @@ func StartPod(ctx context.Context, kubeClient *kubernetes.Client, podName, build
 	// which the pods are configured to download at boot and run.
 	// This lets us/ update the buildlet more easily than
 	// rebuilding the whole pod image.
-	addEnv("META_BUILDLET_BINARY_URL", conf.BuildletBinaryURL())
-	addEnv("META_BUILDER_TYPE", builderType)
+	addEnv("META_BUILDLET_BINARY_URL", conf.BuildletBinaryURL(buildenv.ByProjectID(opts.ProjectID)))
+	addEnv("META_BUILDLET_HOST_TYPE", hostType)
 	if !opts.TLS.IsZero() {
 		addEnv("META_TLS_CERT", opts.TLS.CertPEM)
 		addEnv("META_TLS_KEY", opts.TLS.KeyPEM)
@@ -136,27 +150,28 @@ func StartPod(ctx context.Context, kubeClient *kubernetes.Client, podName, build
 		pod.ObjectMeta.Annotations["delete-at"] = fmt.Sprint(time.Now().Add(opts.DeleteIn).Unix())
 	}
 
-	newPod, err := kubeClient.RunPod(ctx, pod)
+	condRun(opts.OnPodCreating)
+	podStatus, err := kubeClient.RunLongLivedPod(ctx, pod)
 	if err != nil {
-		return nil, fmt.Errorf("pod could not be created: %v", err)
+		return nil, err
 	}
-	condRun(opts.OnPodCreated)
 
 	// The new pod must be in Running phase. Possible phases are described at
 	// http://releases.k8s.io/HEAD/docs/user-guide/pod-states.md#pod-phase
-	if newPod.Status.Phase != api.PodRunning {
-		return nil, fmt.Errorf("pod is in invalid state %q: %v", newPod.Status.Phase, newPod.Status.Message)
+	if podStatus.Phase != api.PodRunning {
+		return nil, fmt.Errorf("pod is in invalid state %q: %v", podStatus.Phase, podStatus.Message)
 	}
+	condRun(opts.OnPodCreated)
 
 	// Wait for the pod to boot and its buildlet to come up.
 	var buildletURL string
 	var ipPort string
 	if !opts.TLS.IsZero() {
-		buildletURL = "https://" + newPod.Status.PodIP
-		ipPort = newPod.Status.PodIP + ":443"
+		buildletURL = "https://" + podStatus.PodIP
+		ipPort = podStatus.PodIP + ":443"
 	} else {
-		buildletURL = "http://" + newPod.Status.PodIP
-		ipPort = newPod.Status.PodIP + ":80"
+		buildletURL = "http://" + podStatus.PodIP
+		ipPort = podStatus.PodIP + ":80"
 	}
 	condRun(opts.OnGotPodInfo)
 

@@ -5,8 +5,6 @@
 // Package pargzip contains a parallel gzip writer implementation.  By
 // compressing each chunk of data in parallel, all the CPUs on the
 // machine can be used, at a slight loss of compression efficiency.
-// In addition, this implementation can use the system gzip binary as
-// a child process, which is faster than Go's native implementation.
 package pargzip
 
 import (
@@ -14,7 +12,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
-	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
@@ -26,10 +23,6 @@ import (
 // Any exported fields may only be mutated before the first call to
 // Write.
 type Writer struct {
-	// UseSystemGzip controls whether the system gzip binary is
-	// used. The default from NewWriter is true.
-	UseSystemGzip bool
-
 	// ChunkSize is the number of bytes to gzip at once.
 	// The default from NewWriter is 1MB.
 	ChunkSize int
@@ -74,21 +67,12 @@ func (c *writeChunk) compress() (err error) {
 		<-c.zw.sem
 	}()
 	var zbuf bytes.Buffer
-	if c.zw.UseSystemGzip {
-		cmd := exec.Command("gzip")
-		cmd.Stdin = strings.NewReader(c.p)
-		cmd.Stdout = &zbuf
-		if err := cmd.Run(); err != nil {
-			return err
-		}
-	} else {
-		zw := gzip.NewWriter(&zbuf)
-		if _, err := io.Copy(zw, strings.NewReader(c.p)); err != nil {
-			return err
-		}
-		if err := zw.Close(); err != nil {
-			return err
-		}
+	zw := gzip.NewWriter(&zbuf)
+	if _, err := io.Copy(zw, strings.NewReader(c.p)); err != nil {
+		return err
+	}
+	if err := zw.Close(); err != nil {
+		return err
 	}
 	c.z = zbuf.Bytes()
 	return nil
@@ -108,9 +92,8 @@ func NewWriter(w io.Writer) *Writer {
 		allWritten:  make(chan struct{}),
 		wasWriteErr: make(chan struct{}),
 
-		UseSystemGzip: true,
-		ChunkSize:     1 << 20,
-		Parallel:      runtime.NumCPU(),
+		ChunkSize: 1 << 20,
+		Parallel:  runtime.NumCPU(),
 	}
 }
 

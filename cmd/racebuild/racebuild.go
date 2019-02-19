@@ -4,13 +4,14 @@
 
 // racebuild builds the race runtime (syso files) on all supported OSes using gomote.
 // Usage:
-//	$ racebuild -rev <llvm_revision> -goroot <path_to_go_repo>
+//	$ racebuild -rev <llvm_git_revision> -goroot <path_to_go_repo>
 package main
 
 import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -18,16 +19,24 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
 var (
-	flagGoroot = flag.String("goroot", "", "path to Go repository to update (required)")
-	flagRev    = flag.String("rev", "", "llvm compiler-rt git revision from http://llvm.org/git/compiler-rt.git (required)")
+	flagGoroot    = flag.String("goroot", "", "path to Go repository to update (required)")
+	flagRev       = flag.String("rev", "", "llvm compiler-rt git revision from http://llvm.org/git/compiler-rt.git (required)")
+	flagGoRev     = flag.String("gorev", "HEAD", "Go repository revision to use; HEAD is relative to --goroot")
+	flagPlatforms = flag.String("platforms", "all", `comma-separated platforms (such as "linux/amd64") to rebuild, or "all"`)
 )
+
+// goRev is the resolved commit ID of flagGoRev.
+var goRev string
 
 // TODO: use buildlet package instead of calling out to gomote.
 var platforms = []*Platform{
@@ -38,6 +47,9 @@ var platforms = []*Platform{
 		Script: `#!/usr/bin/env bash
 set -e
 git clone https://go.googlesource.com/go
+pushd go
+git checkout $GOREV
+popd
 git clone http://llvm.org/git/compiler-rt.git
 (cd compiler-rt && git checkout $REV)
 (cd compiler-rt/lib/tsan/go && CC=clang ./buildgo.sh)
@@ -48,10 +60,13 @@ cp compiler-rt/lib/tsan/go/race_freebsd_amd64.syso go/src/runtime/race
 	&Platform{
 		OS:   "darwin",
 		Arch: "amd64",
-		Type: "darwin-amd64-10_10",
+		Type: "darwin-amd64-10_12",
 		Script: `#!/usr/bin/env bash
 set -e
 git clone https://go.googlesource.com/go
+pushd go
+git checkout $GOREV
+popd
 git clone http://llvm.org/git/compiler-rt.git
 (cd compiler-rt && git checkout $REV)
 (cd compiler-rt/lib/tsan/go && CC=clang ./buildgo.sh)
@@ -68,6 +83,9 @@ set -e
 apt-get update
 apt-get install -y git g++
 git clone https://go.googlesource.com/go
+pushd go
+git checkout $GOREV
+popd
 git clone http://llvm.org/git/compiler-rt.git
 (cd compiler-rt && git checkout $REV)
 (cd compiler-rt/lib/tsan/go && ./buildgo.sh)
@@ -76,12 +94,60 @@ cp compiler-rt/lib/tsan/go/race_linux_amd64.syso go/src/runtime/race
 			`,
 	},
 	&Platform{
+		OS:   "linux",
+		Arch: "ppc64le",
+		Type: "linux-ppc64le-buildlet",
+		Script: `#!/usr/bin/env bash
+set -e
+apt-get update
+apt-get install -y git g++
+git clone https://go.googlesource.com/go
+pushd go
+git checkout $GOREV
+popd
+git clone http://llvm.org/git/compiler-rt.git
+(cd compiler-rt && git checkout $REV)
+(cd compiler-rt/lib/tsan/go && ./buildgo.sh)
+cp compiler-rt/lib/tsan/go/race_linux_ppc64le.syso go/src/runtime/race
+# TODO(#23731): Uncomment to test the syso file before accepting it.
+# (cd go/src && ./race.bash)
+			`,
+	},
+	&Platform{
+		OS:   "netbsd",
+		Arch: "amd64",
+		Type: "netbsd-amd64-8_0",
+		Script: `#!/usr/bin/env bash
+set -e
+git clone https://go.googlesource.com/go
+pushd go
+git checkout $GOREV
+popd
+git clone http://llvm.org/git/compiler-rt.git
+(cd compiler-rt && git checkout $REV)
+(cd compiler-rt/lib/tsan/go && CC=clang ./buildgo.sh)
+cp compiler-rt/lib/tsan/go/race_netbsd_amd64.syso go/src/runtime/race
+# TODO(#24322): Uncomment to test the syso file before accepting it.
+# (cd go/src && ./race.bash)
+			`,
+	},
+	&Platform{
 		OS:   "windows",
 		Arch: "amd64",
 		Type: "windows-amd64-race",
 		Script: `
+@"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -InputFormat None -ExecutionPolicy Bypass -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))" && SET "PATH=%PATH%;%ALLUSERSPROFILE%\chocolatey\bin"
+choco install git -y
+if %errorlevel% neq 0 exit /b %errorlevel%
+choco install mingw --version 5.3.0 -y
+if %errorlevel% neq 0 exit /b %errorlevel%
+call refreshenv
 git clone https://go.googlesource.com/go
 if %errorlevel% neq 0 exit /b %errorlevel%
+cd go
+git checkout %GOREV%
+if %errorlevel% neq 0 exit /b %errorlevel%
+cd ..
 git clone http://llvm.org/git/compiler-rt.git
 if %errorlevel% neq 0 exit /b %errorlevel%
 cd compiler-rt
@@ -101,107 +167,142 @@ if %errorlevel% neq 0 exit /b %errorlevel%
 	},
 }
 
+func init() {
+	// Ensure that there are no duplicate platform entries.
+	seen := make(map[string]bool)
+	for _, p := range platforms {
+		if seen[p.Name()] {
+			log.Fatalf("Duplicate platforms entry for %s.", p.Name())
+		}
+		seen[p.Name()] = true
+	}
+}
+
+var platformEnabled = make(map[string]bool)
+
+func parsePlatformsFlag() {
+	if *flagPlatforms == "all" {
+		for _, p := range platforms {
+			platformEnabled[p.Name()] = true
+		}
+		return
+	}
+
+	var invalid []string
+	for _, name := range strings.Split(*flagPlatforms, ",") {
+		for _, p := range platforms {
+			if name == p.Name() {
+				platformEnabled[name] = true
+				break
+			}
+		}
+		if !platformEnabled[name] {
+			invalid = append(invalid, name)
+		}
+	}
+
+	if len(invalid) > 0 {
+		var msg bytes.Buffer
+		fmt.Fprintf(&msg, "Unrecognized platforms: %q. Supported platforms are:\n", invalid)
+		for _, p := range platforms {
+			fmt.Fprintf(&msg, "\t%s/%s\n", p.OS, p.Arch)
+		}
+		log.Fatal(&msg)
+	}
+}
+
 func main() {
 	flag.Parse()
-	if *flagRev == "" || *flagGoroot == "" {
+	if *flagRev == "" || *flagGoroot == "" || *flagGoRev == "" {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
+	parsePlatformsFlag()
 
-	// Update revision in the README file.
-	// Do this early to check goroot correctness.
-	readmeFile := filepath.Join(*flagGoroot, "src", "runtime", "race", "README")
-	readme, err := ioutil.ReadFile(readmeFile)
+	cmd := exec.Command("git", "rev-parse", *flagGoRev)
+	cmd.Dir = *flagGoroot
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
 	if err != nil {
-		log.Fatalf("bad -goroot? %v", err)
+		log.Fatalf("%s failed: %v", strings.Join(cmd.Args, " "), err)
 	}
-	readmeRev := regexp.MustCompile("Current runtime is built on rev ([0-9,a-z]+)\\.").FindSubmatchIndex(readme)
-	if readmeRev == nil {
-		log.Fatalf("failed to find current revision in src/runtime/race/README")
-	}
-	readme = bytes.Replace(readme, readme[readmeRev[2]:readmeRev[3]], []byte(*flagRev), -1)
-	if err := ioutil.WriteFile(readmeFile, readme, 0640); err != nil {
-		log.Fatalf("failed to write README file: %v", err)
-	}
+	goRev = string(bytes.TrimSpace(out))
+	log.Printf("using Go revision: %s", goRev)
 
 	// Start build on all platforms in parallel.
-	var wg sync.WaitGroup
-	wg.Add(len(platforms))
-	for _, p := range platforms {
-		p := p
-		go func() {
-			defer wg.Done()
-			p.Err = p.Build()
-			if p.Err != nil {
-				p.Err = fmt.Errorf("failed: %v", p.Err)
-				log.Printf("%v: %v", p.Name, p.Err)
-			}
-		}()
-	}
-	wg.Wait()
+	// On interrupt, destroy any in-flight builders before exiting.
+	ctx, cancel := context.WithCancel(context.Background())
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt)
+	go func() {
+		<-shutdown
+		cancel()
+	}()
 
-	// Duplicate results, they can get lost in the log.
-	ok := true
-	log.Printf("---")
+	g, ctx := errgroup.WithContext(ctx)
 	for _, p := range platforms {
-		if p.Err == nil {
-			log.Printf("%v: ok", p.Name)
+		if !platformEnabled[p.Name()] {
 			continue
 		}
-		ok = false
-		log.Printf("%v: %v", p.Name, p.Err)
+
+		p := p
+		g.Go(func() error {
+			if err := p.Build(ctx); err != nil {
+				return fmt.Errorf("%v failed: %v", p.Name(), err)
+			}
+			return p.UpdateReadme()
+		})
 	}
-	if !ok {
-		os.Exit(1)
+
+	if err := g.Wait(); err != nil {
+		log.Fatal(err)
 	}
 }
 
 type Platform struct {
 	OS     string
 	Arch   string
-	Name   string // something for logging
 	Type   string // gomote instance type
 	Inst   string // actual gomote instance name
-	Err    error
-	Log    *os.File
 	Script string
 }
 
-func (p *Platform) Build() error {
-	p.Name = fmt.Sprintf("%v-%v", p.OS, p.Arch)
+func (p *Platform) Name() string {
+	return fmt.Sprintf("%v/%v", p.OS, p.Arch)
+}
 
-	// Open log file.
-	var err error
-	p.Log, err = ioutil.TempFile("", p.Name)
-	if err != nil {
-		return fmt.Errorf("failed to create log file: %v", err)
-	}
-	defer p.Log.Close()
-	log.Printf("%v: logging to %v", p.Name, p.Log.Name())
+// Basename returns the name of the output file relative to src/runtime/race.
+func (p *Platform) Basename() string {
+	return fmt.Sprintf("race_%v_%s.syso", p.OS, p.Arch)
+}
 
+func (p *Platform) Build(ctx context.Context) error {
 	// Create gomote instance (or reuse an existing instance for debugging).
-	if p.Inst == "" {
-		// Creation sometimes fails with transient errors like:
-		// "buildlet didn't come up at http://10.240.0.13 in 3m0s".
-		var createErr error
-		for i := 0; i < 10; i++ {
-			inst, err := p.Gomote("create", p.Type)
-			if err != nil {
-				log.Printf("%v: instance creation failed, retrying", p.Name)
-				createErr = err
+	var lastErr error
+	for p.Inst == "" {
+		inst, err := p.Gomote(ctx, "create", p.Type)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				if lastErr != nil {
+					return lastErr
+				}
+				return err
+			default:
+				// Creation sometimes fails with transient errors like:
+				// "buildlet didn't come up at http://10.240.0.13 in 3m0s".
+				log.Printf("%v: instance creation failed, retrying", p.Name())
+				lastErr = err
 				continue
 			}
-			p.Inst = strings.Trim(string(inst), " \t\n")
-			break
 		}
-		if p.Inst == "" {
-			return createErr
-		}
+		p.Inst = strings.Trim(string(inst), " \t\n")
+		defer p.Gomote(context.Background(), "destroy", p.Inst)
 	}
-	log.Printf("%s: using instance %v", p.Name, p.Inst)
+	log.Printf("%s: using instance %v", p.Name(), p.Inst)
 
 	// put14
-	if _, err := p.Gomote("put14", p.Inst); err != nil {
+	if _, err := p.Gomote(ctx, "put14", p.Inst); err != nil {
 		return err
 	}
 
@@ -222,16 +323,16 @@ func (p *Platform) Build() error {
 	if p.OS == "windows" {
 		targetName = "script.bat"
 	}
-	if _, err := p.Gomote("put", "-mode=0700", p.Inst, script.Name(), targetName); err != nil {
+	if _, err := p.Gomote(ctx, "put", "-mode=0700", p.Inst, script.Name(), targetName); err != nil {
 		return err
 	}
-	if _, err := p.Gomote("run", "-e=REV="+*flagRev, p.Inst, targetName); err != nil {
+	if _, err := p.Gomote(ctx, "run", "-e=REV="+*flagRev, "-e=GOREV="+goRev, p.Inst, targetName); err != nil {
 		return err
 	}
 
 	// The script is supposed to leave updated runtime at that path. Copy it out.
-	syso := fmt.Sprintf("race_%v_%s.syso", p.OS, p.Arch)
-	targz, err := p.Gomote("gettar", "-dir=go/src/runtime/race/"+syso, p.Inst)
+	syso := p.Basename()
+	targz, err := p.Gomote(ctx, "gettar", "-dir=go/src/runtime/race/"+syso, p.Inst)
 	if err != nil {
 		return err
 	}
@@ -241,7 +342,7 @@ func (p *Platform) Build() error {
 		return fmt.Errorf("%v", err)
 	}
 
-	log.Printf("%v: build completed", p.Name)
+	log.Printf("%v: build completed", p.Name())
 	return nil
 }
 
@@ -269,16 +370,90 @@ func (p *Platform) WriteSyso(sysof string, targz []byte) error {
 	return nil
 }
 
-func (p *Platform) Gomote(args ...string) ([]byte, error) {
-	log.Printf("%v: gomote %v", p.Name, args)
-	fmt.Fprintf(p.Log, "$ gomote %v\n", args)
-	output, err := exec.Command("gomote", args...).CombinedOutput()
-	if err != nil || args[0] != "gettar" {
-		p.Log.Write(output)
-	}
-	fmt.Fprintf(p.Log, "\n\n")
+var readmeMu sync.Mutex
+
+func (p *Platform) UpdateReadme() error {
+	readmeMu.Lock()
+	defer readmeMu.Unlock()
+
+	readmeFile := filepath.Join(*flagGoroot, "src", "runtime", "race", "README")
+	readme, err := ioutil.ReadFile(readmeFile)
 	if err != nil {
-		err = fmt.Errorf("gomote %v failed: %v", args, err)
+		log.Fatalf("bad -goroot? %v", err)
 	}
-	return output, err
+
+	syso := p.Basename()
+	const (
+		readmeTmpl = "%s built with LLVM %s and Go %s."
+		commitRE   = "[0-9a-f]+"
+	)
+
+	// TODO(bcmills): Extract the C++ toolchain version from the .syso file and
+	// record it in the README.
+	updatedLine := fmt.Sprintf(readmeTmpl, syso, *flagRev, goRev)
+
+	lineRE, err := regexp.Compile("(?m)^" + fmt.Sprintf(readmeTmpl, regexp.QuoteMeta(syso), commitRE, commitRE) + "$")
+	if err != nil {
+		return err
+	}
+	if lineRE.Match(readme) {
+		readme = lineRE.ReplaceAll(readme, []byte(updatedLine))
+	} else {
+		readme = append(append(readme, []byte(updatedLine)...), '\n')
+	}
+
+	return ioutil.WriteFile(readmeFile, readme, 0640)
+}
+
+func (p *Platform) Gomote(ctx context.Context, args ...string) ([]byte, error) {
+	log.Printf("%v: gomote %v", p.Name(), args)
+
+	cmd := exec.CommandContext(ctx, "gomote", args...)
+	outBuf := new(bytes.Buffer)
+
+	// Combine stderr and stdout for everything except gettar: gettar's output is
+	// huge, so we only want to log stderr for it.
+	errBuf := outBuf
+	if args[0] == "gettar" {
+		errBuf = new(bytes.Buffer)
+	}
+
+	cmd.Stdout = outBuf
+	cmd.Stderr = errBuf
+	run := cmd.Run
+	if len(platformEnabled) == 1 {
+		// If building only one platform, stream gomote output to os.Stderr.
+		r, w := io.Pipe()
+		errTee := io.TeeReader(r, cmd.Stderr)
+		if cmd.Stdout == cmd.Stderr {
+			cmd.Stdout = w
+		}
+		cmd.Stderr = w
+
+		run = func() (err error) {
+			go func() {
+				err = cmd.Run()
+				w.Close()
+			}()
+			io.Copy(os.Stderr, errTee)
+			return
+		}
+	}
+
+	if err := run(); err != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		log.Printf("%v: gomote %v failed:\n%s", p.Name(), args, errBuf)
+		return nil, err
+	}
+
+	if errBuf.Len() == 0 {
+		log.Printf("%v: gomote %v succeeded: <no output>", p.Name(), args)
+	} else {
+		log.Printf("%v: gomote %v succeeded:\n%s", p.Name(), args, errBuf)
+	}
+	return outBuf.Bytes(), nil
 }

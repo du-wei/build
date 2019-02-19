@@ -6,7 +6,7 @@ set -e
 
 # Download Plan 9
 if ! sha1sum -c plan9-gce.iso.sha1; then
-  curl --fail -O http://9legacy.org/download/go/2015-02-26/plan9-gce.iso.bz2
+  curl --fail -O http://9legacy.org/download/go/2018-11-30/plan9-gce.iso.bz2
   bunzip2 plan9-gce.iso.bz2
   sha1sum -c plan9-gce.iso.sha1
 fi
@@ -136,6 +136,12 @@ expect -exact "term% "
 send "9fat:\n"
 
 expect -exact "term% "
+send "sed /^debugboot'='/d /n/9fat/plan9.ini >/tmp/plan9.ini\n"
+
+expect -exact "term% "
+send "mv /tmp/plan9.ini /n/9fat/plan9.ini\n"
+
+expect -exact "term% "
 send "sed s/9pcf/9pccpuf/ /n/9fat/plan9.ini >/tmp/plan9.ini\n"
 
 expect -exact "term% "
@@ -178,10 +184,16 @@ expect -exact "term% "
 send "echo echo remove 10.0.0.0 /104 10.0.0.0 '>'/net/iproute >>/cfg/helix/cpurc\n"
 
 expect -exact "term% "
-send "echo ramfs -u >>/cfg/helix/cpustart\n"
+send "echo ramfs -su >>/cfg/helix/cpustart\n"
+
+expect -exact "term% "
+send "echo mount -c /srv/ramfs /tmp >>/cfg/helix/cpustart\n"
 
 expect -exact "term% "
 send "echo aux/randfs -m /dev >>/cfg/helix/cpustart\n"
+
+expect -exact "term% "
+send "echo kill timesync '|' rc >>/cfg/helix/cpustart\n"
 
 expect -exact "term% "
 send "echo >>/cfg/helix/cpustart\n"
@@ -214,6 +226,9 @@ expect -exact "term% "
 send "echo fshalt >>/cfg/helix/cpustart\n"
 
 expect -exact "term% "
+send "sed /exec/d \\\$home/lib/profile >\\\$home/lib/profile.new && mv \\\$home/lib/profile.new \\\$home/lib/profile\n"
+
+expect -exact "term% "
 send "auth/wrkey\n"
 
 expect -exact "authid: "
@@ -234,6 +249,8 @@ send "fshalt\n"
 expect -exact "done halting"
 exit
 EOF
+
+echo
 
 # Create Compute Engine disk image.
 echo "Archiving disk.raw... (this may take a while)"

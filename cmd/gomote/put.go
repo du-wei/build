@@ -22,7 +22,7 @@ import (
 func putTar(args []string) error {
 	fs := flag.NewFlagSet("put", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "create usage: gomote puttar [put-opts] <buildlet-name> [tar.gz file or '-' for stdin]")
+		fmt.Fprintln(os.Stderr, "puttar usage: gomote puttar [put-opts] <buildlet-name> [tar.gz file or '-' for stdin]")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -46,7 +46,7 @@ func putTar(args []string) error {
 	}
 
 	name := fs.Arg(0)
-	bc, err := namedClient(name)
+	bc, _, err := clientAndConf(name)
 	if err != nil {
 		return err
 	}
@@ -90,7 +90,7 @@ func putTar(args []string) error {
 func put14(args []string) error {
 	fs := flag.NewFlagSet("put14", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "create usage: gomote put14 <buildlet-name>")
+		fmt.Fprintln(os.Stderr, "put14 usage: gomote put14 <buildlet-name>")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -103,18 +103,19 @@ func put14(args []string) error {
 	if err != nil {
 		return err
 	}
-	if conf.Go14URL == "" {
-		fmt.Printf("No Go14URL field defined for %q; ignoring. (may be baked into image)\n", name)
+	u := conf.GoBootstrapURL(buildEnv)
+	if u == "" {
+		fmt.Printf("No GoBootstrapURL defined for %q; ignoring. (may be baked into image)\n", name)
 		return nil
 	}
-	return bc.PutTarFromURL(conf.Go14URL, "go1.4")
+	return bc.PutTarFromURL(u, "go1.4")
 }
 
 // put single file
 func put(args []string) error {
 	fs := flag.NewFlagSet("put", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "create usage: gomote put [put-opts] <buildlet-name> <source or '-' for stdin> [destination]")
+		fmt.Fprintln(os.Stderr, "put usage: gomote put [put-opts] <buildlet-name> <source or '-' for stdin> [destination]")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -124,7 +125,7 @@ func put(args []string) error {
 		fs.Usage()
 	}
 
-	bc, err := namedClient(fs.Arg(0))
+	bc, _, err := clientAndConf(fs.Arg(0))
 	if err != nil {
 		return err
 	}

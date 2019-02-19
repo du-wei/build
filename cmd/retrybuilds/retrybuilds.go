@@ -105,6 +105,7 @@ func fixTheFlakes() {
 
 var flakePhrases = []string{
 	"No space left on device",
+	"no space left on device", // solaris case apparently
 	"fatal error: error in backend: IO failure on output stream",
 	"Boffset: unknown state 0",
 	"Bseek: unknown state 0",
@@ -112,9 +113,19 @@ var flakePhrases = []string{
 	"remote error: User Is Over Quota",
 	"fatal: remote did not send all necessary objects",
 	"Failed to schedule \"", // e.g. Failed to schedule "go_test:archive/tar" test after 3 tries.
+	"lookup _xmpp-server._tcp.google.com. on 8.8.8.8:53: dial udp 8.8.8.8:53: i/o timeout",
+	"lookup _xmpp-server._tcp.google.com on",
+	"lookup gmail.com. on 8.8.8.8:53: dial udp 8.8.8.8:53: i/o timeout",
+	"lookup gmail.com on 8.8.8.8:53",
+	"lookup www.mit.edu on ",
+	"undefined: runtime.SetMutexProfileFraction", // ppc64 builders had not-quite-go1.8 bootstrap
+	"make.bat: The parameter is incorrect",
 }
 
 func isFlaky(failLog string) bool {
+	if strings.Count(strings.TrimSpace(failLog), "\n") < 2 {
+		return true
+	}
 	if strings.HasPrefix(failLog, "exit status ") {
 		return true
 	}

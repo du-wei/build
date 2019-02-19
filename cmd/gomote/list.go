@@ -28,31 +28,65 @@ func list(args []string) error {
 		fs.Usage()
 	}
 
-	cc := coordinatorClient()
+	cc, err := buildlet.NewCoordinatorClientFromFlags()
+	if err != nil {
+		log.Fatal(err)
+	}
 	rbs, err := cc.RemoteBuildlets()
 	if err != nil {
 		log.Fatal(err)
 	}
 	for _, rb := range rbs {
-		fmt.Printf("%s\t%s\texpires in %v\n", rb.Name, rb.Type, rb.Expires.Sub(time.Now()))
+		fmt.Printf("%s\t%s\t%s\texpires in %v\n", rb.Name, rb.BuilderType, rb.HostType, rb.Expires.Sub(time.Now()))
 	}
 
 	return nil
 }
 
-func clientAndConf(name string) (bc *buildlet.Client, conf dashboard.BuildConfig, err error) {
-	cc := coordinatorClient()
+// clientAndConfig returns a buildlet.Client and its build config for
+// a named remote buildlet (a buildlet connection owned by the build
+// coordinator).
+//
+// As a special case, if name contains '@', the name is expected to be
+// of the form <build-config-name>@ip[:port]. For example,
+// "windows-amd64-race@10.0.0.1".
+func clientAndConf(name string) (bc *buildlet.Client, conf *dashboard.BuildConfig, err error) {
+	var ok bool
+
+	if strings.Contains(name, "@") {
+		f := strings.SplitN(name, "@", 2)
+		if len(f) != 2 {
+			err = fmt.Errorf("unsupported name %q; for @ form expect <build-config-name>@host[:port]", name)
+			return
+		}
+		builderType := f[0]
+		conf, ok = dashboard.Builders[builderType]
+		if !ok {
+			err = fmt.Errorf("unknown builder type %q (name %q)", builderType, name)
+			return
+		}
+		ipPort := f[1]
+		if !strings.Contains(ipPort, ":") {
+			ipPort += ":80"
+		}
+		bc = buildlet.NewClient(ipPort, buildlet.NoKeyPair)
+		return
+	}
+
+	cc, err := buildlet.NewCoordinatorClientFromFlags()
+	if err != nil {
+		return
+	}
 
 	rbs, err := cc.RemoteBuildlets()
 	if err != nil {
 		return
 	}
-	var ok bool
 	for _, rb := range rbs {
 		if rb.Name == name {
-			conf, ok = namedConfig(rb.Type)
+			conf, ok = dashboard.Builders[rb.BuilderType]
 			if !ok {
-				err = fmt.Errorf("builder %q exists, but unknown type %q", name, rb.Type)
+				err = fmt.Errorf("builder %q exists, but unknown builder type %q", name, rb.BuilderType)
 				return
 			}
 			break
@@ -63,26 +97,9 @@ func clientAndConf(name string) (bc *buildlet.Client, conf dashboard.BuildConfig
 		return
 	}
 
-	bc, err = namedClient(name)
-	return
-}
-
-func namedClient(name string) (*buildlet.Client, error) {
-	if strings.Contains(name, ":") {
-		return buildlet.NewClient(name, buildlet.NoKeyPair), nil
+	bc, err = cc.NamedBuildlet(name)
+	if err != nil {
+		return
 	}
-	cc := coordinatorClient()
-	return cc.NamedBuildlet(name)
-}
-
-// namedConfig returns the builder configuration that matches the given mote
-// name. It matches prefixes to accommodate motes than have "-n" suffixes.
-func namedConfig(name string) (dashboard.BuildConfig, bool) {
-	match := ""
-	for cname := range dashboard.Builders {
-		if strings.HasPrefix(name, cname) && len(cname) > len(match) {
-			match = cname
-		}
-	}
-	return dashboard.Builders[match], match != ""
+	return bc, conf, nil
 }

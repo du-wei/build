@@ -6,6 +6,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"crypto/sha1"
@@ -25,8 +26,10 @@ import (
 
 func push(args []string) error {
 	fs := flag.NewFlagSet("push", flag.ContinueOnError)
+	var dryRun bool
+	fs.BoolVar(&dryRun, "dry-run", false, "print what would be done only")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "create usage: gomote push <instance>")
+		fmt.Fprintln(os.Stderr, "push usage: gomote push <instance>")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -48,13 +51,12 @@ func push(args []string) error {
 		fs.Usage()
 	}
 	name := fs.Arg(0)
-	bc, err := namedClient(name)
+	bc, conf, err := clientAndConf(name)
 	if err != nil {
 		return err
 	}
 
 	haveGo14 := false
-	haveGo := false
 	remote := map[string]buildlet.DirEntry{} // keys like "src/make.bash"
 
 	lsOpts := buildlet.ListDirOpts{
@@ -78,7 +80,6 @@ func push(args []string) error {
 			return
 		}
 		if strings.HasPrefix(name, "go/") {
-			haveGo = true
 			remote[name[len("go/"):]] = ent
 		}
 
@@ -87,26 +88,56 @@ func push(args []string) error {
 	}
 
 	if !haveGo14 {
-		if conf, ok := namedConfig(name); ok {
-			if conf.Go14URL != "" {
-				log.Printf("installing go1.4")
-				if err := bc.PutTarFromURL(conf.Go14URL, "go1.4"); err != nil {
+		if u := conf.GoBootstrapURL(buildEnv); u != "" {
+			log.Printf("installing go1.4")
+			if dryRun {
+				log.Printf("(Dry-run) Would have pushed go1.4")
+			} else {
+				if err := bc.PutTarFromURL(u, "go1.4"); err != nil {
 					return err
 				}
 			}
-		} else {
-			log.Printf("unknown buildlet type %q has no go1.4 directory; ignoring.", name)
 		}
 	}
 
-	// TODO(bradfitz,adg): if !haveGo, then run 'git rev-parse
-	// HEAD' in goroot and see what the user's HEAD is,
-	// approximately. Then tell the buildlet to fetch that tarball
-	// directly from Gerrit as a base. Then do another ListDir to
-	// the buildlet to get the new list, which will result in a
-	// smaller upload payload. This is important when working from
-	// home with a slower network connection to GCE. (upload a few
-	// KB instead of 10-40 MB)
+	// Invoke 'git check-ignore' and use it to query whether paths have been gitignored.
+	// If anything goes wrong at any point, fall back to assuming that nothing is gitignored.
+	var isGitIgnored func(string) bool
+	gci := exec.Command("git", "check-ignore", "--stdin", "-n", "-v", "-z")
+	gci.Env = append(os.Environ(), "GIT_FLUSH=1")
+	gciIn, errIn := gci.StdinPipe()
+	defer gciIn.Close() // allow git process to exit
+	gciOut, errOut := gci.StdoutPipe()
+	errStart := gci.Start()
+	if errIn != nil || errOut != nil || errStart != nil {
+		isGitIgnored = func(string) bool { return false }
+	} else {
+		var failed bool
+		br := bufio.NewReader(gciOut)
+		isGitIgnored = func(path string) bool {
+			if failed {
+				return false
+			}
+			fmt.Fprintf(gciIn, "%s\x00", path)
+			// Response is of form "<source> <NULL> <linenum> <NULL> <pattern> <NULL> <pathname> <NULL>"
+			// Read all four and check that the path is correct.
+			// If so, the path is ignored iff the source (reason why ignored) is non-empty.
+			var resp [4][]byte
+			for i := range resp {
+				b, err := br.ReadBytes(0)
+				if err != nil {
+					failed = true
+					return false
+				}
+				resp[i] = b[:len(b)-1] // drop trailing NULL
+			}
+			// Sanity check
+			if string(resp[3]) != path {
+				panic("git check-ignore path did not roundtrip, got " + string(resp[3]) + " sent " + path)
+			}
+			return len(resp[0]) > 0
+		}
+	}
 
 	type fileInfo struct {
 		fi   os.FileInfo
@@ -124,10 +155,6 @@ func push(args []string) error {
 		if rel == "" {
 			return nil
 		}
-		if strings.HasPrefix(rel, "test/") && isDotArchChar(rel) {
-			// Skip test/bench/shootout/spectral-norm.6, etc.
-			return nil
-		}
 		if fi.IsDir() {
 			switch rel {
 			case ".git", "pkg", "bin":
@@ -135,6 +162,12 @@ func push(args []string) error {
 			}
 		}
 		inf := fileInfo{fi: fi}
+		if isGitIgnored(path) {
+			if fi.Mode().IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if fi.Mode().IsRegular() {
 			inf.sha1, err = fileSHA1(path)
 			if err != nil {
@@ -150,8 +183,34 @@ func push(args []string) error {
 	var toDel []string
 	for rel := range remote {
 		if rel == "VERSION" {
-			// Don't delete this. It's harmless, and necessary.
-			// Clients can overwrite it if they want.
+			// Don't delete this. It's harmless, and
+			// necessary. Clients can overwrite it if they
+			// want. But if there's no VERSION file there,
+			// make.bash/bat assumes there's a git repo in
+			// place, but there's not only not a git repo
+			// there with gomote, but there's no git tool
+			// available either.
+			continue
+		}
+		// Also don't delete the auto-generated files from cmd/dist.
+		// Otherwise gomote users can't gomote push + gomote run make.bash
+		// and then iteratively:
+		// -- hack locally
+		// -- gomote push
+		// -- gomote run go test -v ...
+		// Because the go test would fail remotely without
+		// these files if they were deleted by gomote push.
+		switch rel {
+		case "src/cmd/cgo/zdefaultcc.go",
+			"src/cmd/go/internal/cfg/zdefaultcc.go",
+			"src/cmd/go/internal/cfg/zosarch.go",
+			"src/cmd/internal/objabi/zbootstrap.go",
+			"src/go/build/zcgo.go",
+			"src/runtime/internal/sys/zversion.go":
+			continue
+		}
+		if isGitIgnored(rel) {
+			// Don't delete remote gitignored files; this breaks built toolchains.
 			continue
 		}
 		rel = strings.TrimRight(rel, "/")
@@ -168,14 +227,25 @@ func push(args []string) error {
 			withGo[i] = "go/" + v
 		}
 		sort.Strings(withGo)
-		log.Printf("Deleting remote files: %q", withGo)
-		if err := bc.RemoveAll(withGo...); err != nil {
-			return fmt.Errorf("Deleting remote unwanted files: %v", err)
+		if dryRun {
+			log.Printf("(Dry-run) Would have deleted remote files: %q", withGo)
+		} else {
+			log.Printf("Deleting remote files: %q", withGo)
+			if err := bc.RemoveAll(withGo...); err != nil {
+				return fmt.Errorf("Deleting remote unwanted files: %v", err)
+			}
 		}
 	}
 
 	var toSend []string
+	notHave := 0
+	const maxNotHavePrint = 5
 	for rel, inf := range local {
+		switch rel {
+		case "VERSION.cache", "src/runtime/internal/sys/zversion.go", "src/cmd/internal/objabi/zbootstrap.go",
+			"src/go/build/zcgo.go":
+			continue
+		}
 		if !inf.fi.Mode().IsRegular() {
 			// TODO(bradfitz): this is only doing regular files
 			// for now, so empty directories, symlinks, etc aren't
@@ -187,7 +257,9 @@ func push(args []string) error {
 		}
 		rem, ok := remote[rel]
 		if !ok {
-			log.Printf("Remote doesn't have %q", rel)
+			if notHave++; notHave <= maxNotHavePrint {
+				log.Printf("Remote doesn't have %q", rel)
+			}
 			toSend = append(toSend, rel)
 			continue
 		}
@@ -195,6 +267,9 @@ func push(args []string) error {
 			log.Printf("Remote's %s digest is %q; want %q", rel, rem.Digest(), inf.sha1)
 			toSend = append(toSend, rel)
 		}
+	}
+	if notHave > maxNotHavePrint {
+		log.Printf("Remote doesn't have %d files (only showed %d).", notHave, maxNotHavePrint)
 	}
 	if _, hasVersion := remote["VERSION"]; !hasVersion {
 		log.Printf("Remote lacks a VERSION file; sending a fake one")
@@ -207,6 +282,10 @@ func push(args []string) error {
 			return err
 		}
 		log.Printf("Uploading %d new/changed files; %d byte .tar.gz", len(toSend), tgz.Len())
+		if dryRun {
+			log.Printf("(Dry-run mode; not doing anything.")
+			return nil
+		}
 		if err := bc.PutTar(tgz, "go"); err != nil {
 			return fmt.Errorf("writing tarball to buildlet: %v", err)
 		}
@@ -298,15 +377,4 @@ func fileSHA1(path string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%x", s1.Sum(nil)), nil
-}
-
-func isDotArchChar(path string) bool {
-	if len(path) < 2 || path[len(path)-2] != '.' {
-		return false
-	}
-	switch path[len(path)-1] {
-	case '6', '8', '5', '7', '9':
-		return true
-	}
-	return false
 }

@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -15,7 +16,7 @@ import (
 func getTar(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "create usage: gomote gettar [get-opts] <buildlet-name>")
+		fmt.Fprintln(os.Stderr, "gettar usage: gomote gettar [get-opts] <buildlet-name>")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -28,11 +29,11 @@ func getTar(args []string) error {
 	}
 
 	name := fs.Arg(0)
-	bc, err := namedClient(name)
+	bc, _, err := clientAndConf(name)
 	if err != nil {
 		return err
 	}
-	tgz, err := bc.GetTar(dir)
+	tgz, err := bc.GetTar(context.Background(), dir)
 	if err != nil {
 		return err
 	}

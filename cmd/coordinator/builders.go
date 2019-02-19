@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// +build linux
+
 package main
 
 import (
@@ -14,7 +16,10 @@ import (
 
 func handleBuilders(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
-	if err := buildersTmpl.Execute(&buf, dashboard.Builders); err != nil {
+	if err := buildersTmpl.Execute(&buf, struct {
+		Builders map[string]*dashboard.BuildConfig
+		Hosts    map[string]*dashboard.HostConfig
+	}{dashboard.Builders, dashboard.Hosts}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -29,26 +34,42 @@ var buildersTmpl = template.Must(template.New("builders").Parse(`
 <header>
 	<h1>Go Build Coordinator</h1>
 	<nav>
-		<a href="http://build.golang.org">Dashboard</a>
+		<a href="https://build.golang.org">Dashboard</a>
 		<a href="/builders">Builders</a>
 	</nav>
 	<div class="clear"></div>
 </header>
 
-<h2>Defined Builders</h2>
+<h2 id='builders'>Defined Builders</h2>
 
 <table>
 <thead><tr><th>name</th><th>pool</th><th>owner</th><th>notes</th></tr>
 </thead>
-{{range .}}
+{{range .Builders}}
 <tr>
 	<td>{{.Name}}</td>
-	<td>{{if .IsReverse}}Reverse{{else}}GCE{{end}}</td>
-	<td>{{.ShortOwner}}</td>
+	<td><a href='#{{.HostType}}'>{{.HostType}}</a></td>
+	<td>{{if .OwnerGithub}}<a href='https://github.com/{{.OwnerGithub}}'>@{{.OwnerGithub}}</a>{{else}}{{.ShortOwner}}{{end}}</td>
 	<td>{{.Notes}}</td>
 </tr>
 {{end}}
 </table>
+
+<h2 id='hosts'>Defined Host Types (pools)</h2>
+
+<table>
+<thead><tr><th>name</th><th>type</th><th>notes</th></tr>
+</thead>
+{{range .Hosts}}
+<tr id='{{.HostType}}'>
+	<td>{{.HostType}}</td>
+	<td>{{.PoolName}}</td>
+	<td>{{html .Notes}}</td>
+</tr>
+{{end}}
+</table>
+
+
 </body>
 </html>
 `))

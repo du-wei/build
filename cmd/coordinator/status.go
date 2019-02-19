@@ -2,16 +2,22 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// +build linux
+
 package main
 
 import (
 	"bytes"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
+	"os"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,14 +33,21 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	statusMu.Lock()
 	data := statusData{
-		Total:    len(status),
-		Uptime:   round(time.Now().Sub(processStartTime)),
-		Recent:   append([]*buildStatus{}, statusDone...),
-		DiskFree: df,
-		Version:  Version,
+		Total:        len(status),
+		Uptime:       round(time.Now().Sub(processStartTime)),
+		Recent:       append([]*buildStatus{}, statusDone...),
+		DiskFree:     df,
+		Version:      Version,
+		NumFD:        fdCount(),
+		NumGoroutine: runtime.NumGoroutine(),
 	}
 	for _, st := range status {
-		data.Active = append(data.Active, st)
+		if atomic.LoadInt32(&st.hasBuildlet) != 0 {
+			data.ActiveBuilds++
+			data.Active = append(data.Active, st)
+		} else {
+			data.Pending = append(data.Pending, st)
+		}
 	}
 	// TODO: make this prettier.
 	var buf bytes.Buffer
@@ -45,7 +58,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 				key.ChangeTriple(), key.Commit, key.Commit[:8])
 			fmt.Fprintf(&buf, "   Remain: %d, fails: %v\n", state.remain, state.failed)
 			for _, bs := range ts.builds {
-				fmt.Fprintf(&buf, "  %s: running=%v\n", bs.name, bs.isRunning())
+				fmt.Fprintf(&buf, "  %s: running=%v\n", bs.Name, bs.isRunning())
 			}
 		}
 	}
@@ -54,11 +67,16 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	data.RemoteBuildlets = template.HTML(remoteBuildletStatus())
 
 	sort.Sort(byAge(data.Active))
+	sort.Sort(byAge(data.Pending))
 	sort.Sort(sort.Reverse(byAge(data.Recent)))
 	if errTryDeps != nil {
 		data.TrybotsErr = errTryDeps.Error()
 	} else {
-		data.Trybots = template.HTML(buf.String())
+		if buf.Len() == 0 {
+			data.Trybots = template.HTML("<i>(none)</i>")
+		} else {
+			data.Trybots = template.HTML("<pre>" + buf.String() + "</pre>")
+		}
 	}
 
 	buf.Reset()
@@ -81,6 +99,38 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	buf.WriteTo(w)
 }
 
+func fdCount() int {
+	f, err := os.Open("/proc/self/fd")
+	if err != nil {
+		return -1
+	}
+	defer f.Close()
+	n := 0
+	for {
+		names, err := f.Readdirnames(1000)
+		n += len(names)
+		if err == io.EOF {
+			return n
+		}
+		if err != nil {
+			return -1
+		}
+	}
+}
+
+func friendlyDuration(d time.Duration) string {
+	if d > 10*time.Second {
+		d2 := ((d + 50*time.Millisecond) / (100 * time.Millisecond)) * (100 * time.Millisecond)
+		return d2.String()
+	}
+	if d > time.Second {
+		d2 := ((d + 5*time.Millisecond) / (10 * time.Millisecond)) * (10 * time.Millisecond)
+		return d2.String()
+	}
+	d2 := ((d + 50*time.Microsecond) / (100 * time.Microsecond)) * (100 * time.Microsecond)
+	return d2.String()
+}
+
 func diskFree() string {
 	out, _ := exec.Command("df", "-h").Output()
 	return string(out)
@@ -88,9 +138,13 @@ func diskFree() string {
 
 // statusData is the data that fills out statusTmpl.
 type statusData struct {
-	Total             int
+	Total             int // number of total builds (including those waiting for a buildlet)
+	ActiveBuilds      int // number of running builds (subset of Total with a buildlet)
+	NumFD             int
+	NumGoroutine      int
 	Uptime            time.Duration
-	Active            []*buildStatus
+	Active            []*buildStatus // have a buildlet
+	Pending           []*buildStatus // waiting on a buildlet
 	Recent            []*buildStatus
 	TrybotsErr        string
 	Trybots           template.HTML
@@ -110,44 +164,61 @@ var statusTmpl = template.Must(template.New("status").Parse(`
 <header>
 	<h1>Go Build Coordinator</h1>
 	<nav>
-		<a href="http://build.golang.org">Dashboard</a>
+		<a href="https://build.golang.org">Dashboard</a>
 		<a href="/builders">Builders</a>
 	</nav>
 	<div class="clear"></div>
 </header>
 
 <h2>Running</h2>
-<p>{{printf "%d" .Total}} total builds active. Uptime {{printf "%s" .Uptime}}. Version {{.Version}}.
+<p>{{printf "%d" .Total}} total builds; {{printf "%d" .ActiveBuilds}} active. Uptime {{printf "%s" .Uptime}}. Version {{.Version}}.
 
-<ul>
-{{range .Active}}
-<li><pre>{{.HTMLStatusLine}}</pre></li>
+<h2 id=trybots>Active Trybot Runs <a href='#trybots'>¶</a></h2>
+{{- if .TrybotsErr}}
+<b>trybots disabled:</b>: {{.TrybotsErr}}
+{{else}}
+{{.Trybots}}
 {{end}}
-</ul>
 
-<h2>Trybot state</h2><pre>
-{{if .TrybotsErr}}<b>trybots disabled:</b>: {{.TrybotsErr}}{{else}}{{.Trybots}}{{end}}
-</pre>
-
-<h2>Recently completed</h2>
-<ul>
-{{range .Recent}}
-<li><pre>{{.HTMLStatusLine}}</pre></li>
-{{end}}
-</ul>
-
-<h2>Buildlet pools</h2>
-<ul>
-<li>{{.GCEPoolStatus}}</li>
-<li>{{.KubePoolStatus}}</li>
-<li>{{.ReversePoolStatus}}</li>
-</ul>
-
-<h2>Remote buildlets</h3>
+<h2 id=remote>Remote buildlets <a href='#remote'>¶</a></h3>
 {{.RemoteBuildlets}}
 
-<h2>Disk Space</h2>
+<h2 id=pools>Buildlet pools <a href='#pools'>¶</a></h2>
+<ul>
+	<li>{{.GCEPoolStatus}}</li>
+	<li>{{.KubePoolStatus}}</li>
+	<li>{{.ReversePoolStatus}}</li>
+</ul>
+
+<h2 id=active>Active builds <a href='#active'>¶</a></h2>
+<ul>
+	{{range .Active}}
+	<li><pre>{{.HTMLStatusLine}}</pre></li>
+	{{end}}
+</ul>
+
+<h2 id=pending>Pending builds <a href='#pending'>¶</a></h2>
+<ul>
+	{{range .Pending}}
+	<li><pre>{{.HTMLStatusLine}}</pre></li>
+	{{end}}
+</ul>
+
+<h2 id=completed>Recently completed <a href='#completed'>¶</a></h2>
+<ul>
+	{{range .Recent}}
+	<li><span>{{.HTMLStatusLine_done}}</span></li>
+	{{end}}
+</ul>
+
+<h2 id=disk>Disk Space <a href='#disk'>¶</a></h2>
 <pre>{{.DiskFree}}</pre>
+
+<h2 id=fd>File Descriptors <a href='#fd'>¶</a></h2>
+<p>{{.NumFD}}</p>
+
+<h2 id=goroutines>Goroutines <a href='#goroutines'>¶</a></h2>
+<p>{{.NumGoroutine}} <a href='/debug/goroutines'>goroutines</a></p>
 
 </body>
 </html>
@@ -166,9 +237,24 @@ body {
 	margin: 0;
 }
 
-h1, h2 { color: #375EAB; }
+h1, h2, h1 > a, h2 > a, h1 > a:visited, h2 > a:visited { 
+	color: #375EAB; 
+}
 h1 { font-size: 24px; }
 h2 { font-size: 20px; }
+
+h1 > a, h2 > a {
+	display: none;
+	text-decoration: none;
+}
+
+h1:hover > a, h2:hover > a {
+	display: inline;
+}
+
+h1 > a:hover, h2 > a:hover {
+	text-decoration: underline;
+}
 
 pre {
 	font-family: monospace;

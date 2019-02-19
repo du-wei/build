@@ -1,40 +1,91 @@
 package kubernetes_test
 
 import (
-	"log"
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"testing"
 
-	api "github.com/kubernetes/kubernetes/pkg/api/v1"
 	"golang.org/x/build/kubernetes"
-	"golang.org/x/oauth2"
+	"golang.org/x/build/kubernetes/api"
 )
 
-func ExampleRun() {
-	kube, err := kubernetes.NewClient("example.com", &http.Client{
-		Transport: &oauth2.Transport{
-			Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "aCcessWbU3toKen"}),
-		}})
-	if err != nil {
-		log.Fatalf("failed to create client: %v", err)
-	}
-	kube.Run(&api.Pod{
+type handlers []func(w http.ResponseWriter, r *http.Request) error
+
+func newTestPod() *api.Pod {
+	return &api.Pod{
 		TypeMeta: api.TypeMeta{
-			APIVersion: "v1beta3",
+			APIVersion: "v1",
 			Kind:       "Pod",
 		},
 		ObjectMeta: api.ObjectMeta{
-			Name: "my-nginx-pod",
-			Labels: map[string]string{
-				"tag": "prod",
-			},
+			Name: "test-pod",
 		},
 		Spec: api.PodSpec{
 			Containers: []api.Container{
 				{
-					Name:  "my-nginx-container",
-					Image: "nginx:latest",
+					Name:  "test-container",
+					Image: "test-image:latest",
 				},
 			},
 		},
-	})
+	}
+}
+
+func (hs *handlers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if len(*hs) == 0 {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "unexpected request: %v", r)
+		return
+	}
+	h := (*hs)[0]
+	*hs = (*hs)[1:]
+	if err := h(w, r); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "unexpected error: %v", err)
+		return
+	}
+}
+
+func TestRunPod(t *testing.T) {
+	hs := handlers{
+		func(w http.ResponseWriter, r *http.Request) error {
+			if r.Method != http.MethodPost {
+				return fmt.Errorf("expected %q, got %q", http.MethodPost, r.Method)
+
+			}
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(newTestPod())
+			return nil
+		},
+		func(w http.ResponseWriter, r *http.Request) error {
+			if r.Method != http.MethodGet {
+				return fmt.Errorf("expected %q, got %q", http.MethodGet, r.Method)
+			}
+			w.WriteHeader(http.StatusOK)
+			readyPod := newTestPod()
+			readyPod.Status.Phase = api.PodRunning
+			json.NewEncoder(w).Encode(readyPod)
+			return nil
+		},
+	}
+	s := httptest.NewServer(&hs)
+	defer s.Close()
+
+	c, err := kubernetes.NewClient(s.URL, http.DefaultClient)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ps, err := c.RunLongLivedPod(context.Background(), newTestPod())
+	if err != nil {
+		t.Fatalf("RunLongLivePod: %v", err)
+	}
+	if ps.Phase != api.PodRunning {
+		t.Fatalf("Pod phase = %q; want %q", ps.Phase, api.PodRunning)
+	}
+	if len(hs) != 0 {
+		t.Fatalf("failed to process all expected requests: %d left", len(hs))
+	}
 }
